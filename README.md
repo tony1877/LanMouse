@@ -2,6 +2,8 @@
 
 Share one mouse, keyboard and clipboard between two Windows PCs on the same network.
 
+<p align="center"><img src="docs/screenshot.png" alt="LAN Mouse window showing the screen arrangement map" width="440"></p>
+
 ## Features
 
 - **Screen arrangement:** drag the other PC's screens to where they really sit around yours, with full multi-monitor support. The cursor crosses wherever the screens touch.
