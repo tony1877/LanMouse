@@ -73,6 +73,63 @@ static class Native
         CloseDesktop(d);
         return true;
     }
+
+    [DllImport("user32.dll")] static extern nint GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(nint h, out uint pid);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentProcessId();
+    [DllImport("kernel32.dll", SetLastError = true)] static extern nint OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(nint h);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(nint proc, uint access, out nint tok);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(nint tok, int cls, nint info, int len, out int ret);
+
+    /// <summary>
+    /// True when the foreground window belongs to a higher-integrity process than ours (e.g. Task Manager or any
+    /// app run as administrator). Windows (UIPI) then silently drops our simulated input, so it must be routed
+    /// through the SYSTEM agent instead.
+    /// </summary>
+    public static bool ForegroundInputBlocked()
+    {
+        try
+        {
+            var fg = GetForegroundWindow();
+            if (fg == 0) return false;
+            GetWindowThreadProcessId(fg, out uint pid);
+            if (pid == 0) return false;
+            int mine = ProcessIntegrity(GetCurrentProcessId(), 0x2000 /* assume medium for us */);
+            int theirs = ProcessIntegrity(pid, 0x3000 /* if we can't open it, it's above us */);
+            return theirs > mine;
+        }
+        catch { return false; }
+    }
+
+    static int ProcessIntegrity(uint pid, int fallback)
+    {
+        nint h = OpenProcess(0x1000 /* QUERY_LIMITED_INFORMATION */, false, pid);
+        if (h == 0) return fallback;
+        nint tok = 0;
+        try
+        {
+            if (!OpenProcessToken(h, 0x0008 /* TOKEN_QUERY */, out tok)) return fallback;
+            GetTokenInformation(tok, 25 /* TokenIntegrityLevel */, 0, 0, out int len);
+            if (len <= 0) return fallback;
+            nint buf = System.Runtime.InteropServices.Marshal.AllocHGlobal(len);
+            try
+            {
+                if (!GetTokenInformation(tok, 25, buf, len, out _)) return fallback;
+                // TOKEN_MANDATORY_LABEL { SID_AND_ATTRIBUTES Label { PSID Sid; ... } }: Sid is first pointer.
+                nint sid = System.Runtime.InteropServices.Marshal.ReadIntPtr(buf);
+                byte count = System.Runtime.InteropServices.Marshal.ReadByte(sid, 1);     // SubAuthorityCount
+                int rid = System.Runtime.InteropServices.Marshal.ReadInt32(sid, 8 + (count - 1) * 4); // last sub-authority
+                return rid;
+            }
+            finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(buf); }
+        }
+        finally
+        {
+            if (tok != 0) CloseHandle(tok);
+            CloseHandle(h);
+        }
+    }
     [DllImport("user32.dll")] public static extern bool RemoveClipboardFormatListener(nint hwnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool OpenClipboard(nint hwnd);
     [DllImport("user32.dll")] public static extern bool CloseClipboard();

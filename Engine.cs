@@ -80,27 +80,40 @@ sealed partial class Engine : IDisposable
     double senderScale = 1, carryX, carryY;
     long nextDesktopCheck;
     readonly SecureInput secure = new();
-    volatile bool secureActive; // injecting via the agent because this PC's sign-in screen is up
+    volatile bool secureActive;   // injecting via the SYSTEM agent (sign-in screen, or an elevated app blocks us)
+    volatile bool inputBlocked;   // input can't reach the foreground (secure desktop or elevated app) without the agent
 
     /// <summary>
-    /// Controlled side: if this PC switched to a secure desktop (sign-in prompt), our input can't reach it.
-    /// Hand control straight back instead of leaving the other PC's mouse and keyboard stuck here.
+    /// Controlled side: decide how to deliver input. Normal apps take direct SendInput. The secure sign-in screen,
+    /// and elevated foreground apps like Task Manager (which Windows stops ordinary input from reaching), are routed
+    /// through the SYSTEM agent when the user installed sign-in support. Only the unreachable sign-in screen with no
+    /// agent forces control back to the other PC; a merely-blocked elevated app does not (that would feel like a
+    /// random bounce). Returns true only when control was handed back.
     /// </summary>
     bool SecureDesktopBlocks(Link l)
     {
         long now = Environment.TickCount64;
         if (now < nextDesktopCheck) return false;
         nextDesktopCheck = now + 200;
-        if (Native.InputDesktopReachable()) { secureActive = false; return false; }
-        // Secure desktop is up. If the user installed sign-in support, keep going through the agent.
-        if (settings.SignInSupport && secure.TryConnect()) { secureActive = true; return false; }
-        // Otherwise hand control straight back so the other PC's mouse and keyboard aren't stuck here.
+        bool deskUnreachable = !Native.InputDesktopReachable();
+        bool elevated = !deskUnreachable && Native.ForegroundInputBlocked();
+        if (!deskUnreachable && !elevated) { secureActive = false; inputBlocked = false; return false; }
+        // Need the agent: route through it if available (it runs as SYSTEM and can reach both).
+        if (settings.SignInSupport && secure.TryConnect()) { secureActive = true; inputBlocked = false; return false; }
         secureActive = false;
-        controlled = false;
-        ReleaseInjected();
-        l.Send(Wire.Build(Msg.Locked));
-        ThreadPool.QueueUserWorkItem(_ => Fire());
-        return true;
+        inputBlocked = true;
+        if (deskUnreachable)
+        {
+            // Sign-in/secure desktop and no agent: hand control back so the cursor isn't stuck here.
+            controlled = false;
+            ReleaseInjected();
+            l.Send(Wire.Build(Msg.Locked));
+            ThreadPool.QueueUserWorkItem(_ => Fire());
+            return true;
+        }
+        // An elevated app is swallowing our input and there's no agent: we can't control it, but stay put
+        // rather than bouncing back. Ctrl+Alt+<this PC> or Scroll Lock still brings the cursor home.
+        return false;
     }
     long cooldownUntil;
 
@@ -538,6 +551,8 @@ sealed partial class Engine : IDisposable
     {
         controlling = false;
         controlled = false;
+        secureActive = false;
+        inputBlocked = false;
         CursorHider.Set(false);
         lock (forwardedKeys) { forwardedKeys.Clear(); forwardedButtons.Clear(); }
         ReleaseInjected();
@@ -821,6 +836,7 @@ sealed partial class Engine : IDisposable
                 }
                 else (rx, ry) = Screens.ClampOnto(Screens.Monitors, ex, ey, 1);
                 movesApplied = 0;
+                inputBlocked = false;
                 controlled = true;
                 if (SecureDesktopBlocks(l)) break;
                 InjMove(rx, ry);
@@ -839,7 +855,9 @@ sealed partial class Engine : IDisposable
                 if (Screens.At(Screens.Monitors, nx, ny) == null)
                 {
                     // Off our screens. If that spot is one of the controller's screens, hand the cursor back there.
-                    if (peerAllowsEdgeReturn && Screens.At(peerPlaced, nx, ny) != null)
+                    // Not while input is blocked with no agent: the real cursor is frozen (e.g. on Task Manager) and
+                    // our dead-reckoned position would march off the edge and bounce back for no reason.
+                    if ((secureActive || !inputBlocked) && peerAllowsEdgeReturn && Screens.At(peerPlaced, nx, ny) != null)
                     {
                         var dragged = DraggedWindow();
                         controlled = false;
