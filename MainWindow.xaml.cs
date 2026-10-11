@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -30,12 +31,13 @@ public partial class MainWindow : Window
         OptText.IsChecked = settings.ShareText;
         OptImages.IsChecked = settings.ShareImages;
         OptFiles.IsChecked = settings.ShareFiles;
+        OptWindows.IsChecked = settings.ShareWindows;
         OptAuto.IsChecked = settings.AutoConnect;
         OptEdge.IsChecked = settings.EdgeSwitch;
         OptHotkey.IsChecked = settings.HotkeySwitch;
         OptStartup.IsChecked = Settings.StartWithWindows;
 
-        foreach (var cb in new[] { OptInput, OptText, OptImages, OptFiles, OptAuto, OptStartup, OptEdge, OptHotkey })
+        foreach (var cb in new[] { OptInput, OptText, OptImages, OptFiles, OptWindows, OptAuto, OptStartup, OptEdge, OptHotkey })
         {
             cb.Checked += (_, _) => SaveOptions();
             cb.Unchecked += (_, _) => SaveOptions();
@@ -47,6 +49,7 @@ public partial class MainWindow : Window
         MaxHeight = SystemParameters.WorkArea.Height - 16;
         loading = false;
         Refresh();
+        RefreshSignInButton();
     }
 
     static System.Collections.Generic.IEnumerable<string> LocalAddresses()
@@ -67,6 +70,7 @@ public partial class MainWindow : Window
         settings.ShareText = OptText.IsChecked == true;
         settings.ShareImages = OptImages.IsChecked == true;
         settings.ShareFiles = OptFiles.IsChecked == true;
+        settings.ShareWindows = OptWindows.IsChecked == true;
         settings.AutoConnect = OptAuto.IsChecked == true;
         settings.EdgeSwitch = OptEdge.IsChecked == true;
         settings.HotkeySwitch = OptHotkey.IsChecked == true;
@@ -362,6 +366,52 @@ public partial class MainWindow : Window
             App.Current_.Balloon("Firewall rule added. Do the same on the other PC.");
         }
         catch { /* user said no to the admin prompt */ }
+    }
+
+    bool agentInstalled;
+
+    void RefreshSignInButton()
+    {
+        agentInstalled = Agent.IsInstalled();
+        SignInBtn.Content = agentInstalled ? "Remove sign-in support" : "Install sign-in support";
+    }
+
+    void SignIn_Click(object sender, RoutedEventArgs e)
+    {
+        if (agentInstalled)
+        {
+            if (MessageBox.Show(this, "Remove sign-in support from this PC?", "LAN Mouse", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+            SignInBtn.IsEnabled = false;
+            Task.Run(() =>
+            {
+                bool ok = Agent.RunElevated("--uninstall-agent");
+                Dispatcher.BeginInvoke(() =>
+                {
+                    if (ok) { settings.SignInSupport = false; settings.Save(); }
+                    SignInBtn.IsEnabled = true;
+                    RefreshSignInButton();
+                });
+            });
+            return;
+        }
+
+        var msg = "Install sign-in support?\n\n" +
+                  "This adds a small Windows service that lets you type your PIN or password on THIS PC from your other PC.\n\n" +
+                  "Trade-off: while your PCs are connected, anyone who knows your pairing key and is on your network could use this PC's sign-in screen. They would still need your PIN or password to get in.\n\n" +
+                  "You can remove it here at any time. Windows will ask for administrator permission.";
+        if (MessageBox.Show(this, msg, "LAN Mouse", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        SignInBtn.IsEnabled = false;
+        Task.Run(() =>
+        {
+            bool ok = Agent.RunElevated("--install-agent") && Agent.IsInstalled();
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (ok) { settings.SignInSupport = true; settings.Save(); App.Current_.Balloon("Sign-in support installed. Do the same on your other PC to control its sign-in screen."); }
+                else App.Current_.Balloon("Sign-in support was not installed.");
+                SignInBtn.IsEnabled = true;
+                RefreshSignInButton();
+            });
+        });
     }
 
     void ShowPage(bool settingsPage)

@@ -127,9 +127,24 @@
           <CheckBox x:Name="OptText" Style="{StaticResource Switch}" Content="Copied text"/>
           <CheckBox x:Name="OptImages" Style="{StaticResource Switch}" Content="Pictures &amp; screenshots"/>
           <CheckBox x:Name="OptFiles" Style="{StaticResource Switch}" Content="Files &amp; folders"/>
+          <CheckBox x:Name="OptWindows" Style="{StaticResource Switch}" Content="Drag windows to the other PC"/>
           <Rectangle Height="1" Fill="{StaticResource Line}" Margin="0,8"/>
           <CheckBox x:Name="OptStartup" Style="{StaticResource Switch}" Content="Start with Windows (in the tray)"/>
           <CheckBox x:Name="OptAuto" Style="{StaticResource Switch}" Content="Connect automatically on launch"/>
+        </StackPanel>
+      </Border>
+
+      <!-- Sign-in screen -->
+      <TextBlock Text="SIGN-IN SCREEN" Style="{StaticResource Label}" Margin="2,20,0,8"/>
+      <Border Style="{StaticResource CardBox}" Padding="16,12">
+        <StackPanel>
+          <TextBlock TextWrapping="Wrap" Foreground="{StaticResource Sub}" FontSize="12">
+            Windows blocks remote control of its sign-in screen (PIN, password, UAC). Installing sign-in support adds a
+            small Windows service so you can type your PIN on this PC from the other one. Anyone with your pairing key on
+            your network could then use this PC's sign-in screen, though they would still need your PIN or password.
+          </TextBlock>
+          <Button x:Name="SignInBtn" Style="{StaticResource Ghost}" HorizontalAlignment="Left" Margin="-10,8,0,0"
+                  Click="SignIn_Click" Foreground="{StaticResource Accent}" Content="Install sign-in support"/>
         </StackPanel>
       </Border>
 

@@ -211,6 +211,8 @@ enum Msg : byte
 {
     Hello = 1, Enter, Move, Button, Wheel, Key, Return, Release, Yield, Text, Ping, Screens, Layout, Offer, Pull, Gone,
     FilesStart = 20, ImageStart, Chunk, End,
+    Locked = 40,
+    StreamStart = 30, StreamEnd, StreamStop, StreamBack, StreamMouse, StreamKey, StreamFocus, StreamResize, StreamHit,
 }
 
 /// <summary>Tiny message builder/reader for the wire format.</summary>

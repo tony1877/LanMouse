@@ -14,11 +14,18 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <AssemblyName>LanMouse</AssemblyName>
+    <StartupObject>LanMouse.Program</StartupObject>
     <Product>LAN Mouse</Product>
     <Version>3.0.0</Version>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <PackageReference Include="System.IO.Pipes.AccessControl" Version="5.0.0" />
     <Resource Include="app.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Provide our own Main (Program.cs) so headless agent modes start before WPF. -->
+    <ApplicationDefinition Remove="App.xaml" />
+    <Page Include="App.xaml" SubType="Designer" Generator="MSBuild:Compile" />
   </ItemGroup>
 </Project>

@@ -2,5 +2,7 @@ bin/
 obj/
 release/
 release-v6/
+release-new/
+out*/
 *.user
 .vs/

@@ -59,6 +59,20 @@ static class Native
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
     [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint count, INPUT[] inputs, int size);
     [DllImport("user32.dll")] public static extern bool AddClipboardFormatListener(nint hwnd);
+    [DllImport("user32.dll", SetLastError = true)] static extern nint OpenInputDesktop(uint flags, bool inherit, uint access);
+    [DllImport("user32.dll")] static extern bool CloseDesktop(nint desk);
+
+    /// <summary>
+    /// False while Windows shows a secure desktop (sign-in/PIN prompt, UAC, Ctrl+Alt+Del). Normal programs can't
+    /// open it or send input to it, by design.
+    /// </summary>
+    public static bool InputDesktopReachable()
+    {
+        var d = OpenInputDesktop(0, false, 0x0100 /* DESKTOP_SWITCHDESKTOP */);
+        if (d == 0) return false;
+        CloseDesktop(d);
+        return true;
+    }
     [DllImport("user32.dll")] public static extern bool RemoveClipboardFormatListener(nint hwnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool OpenClipboard(nint hwnd);
     [DllImport("user32.dll")] public static extern bool CloseClipboard();

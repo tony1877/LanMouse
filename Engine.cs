@@ -31,7 +31,7 @@ interface IClipboardSink
     object? ReadForPeer(int id, ClipKinds kind);
 }
 
-sealed class Engine : IDisposable
+sealed partial class Engine : IDisposable
 {
     public const int TcpPort = 47823, UdpPort = 47824, DataPort = 47825;
     const byte Protocol = 4;
@@ -66,7 +66,7 @@ sealed class Engine : IDisposable
 
     // -- input state --
     volatile bool controlling, controlled;
-    Native.POINT pin;
+    Native.POINT pin, pinHome;
     readonly HashSet<uint> forwardedKeys = new();
     readonly HashSet<int> forwardedButtons = new();
     readonly HashSet<(ushort vk, ushort scan, bool ext)> injectedKeys = new();
@@ -78,13 +78,37 @@ sealed class Engine : IDisposable
     int movesSent, movesApplied;
     // Display scaling: movement is converted so the pointer covers the same visual distance on both PCs.
     double senderScale = 1, carryX, carryY;
+    long nextDesktopCheck;
+    readonly SecureInput secure = new();
+    volatile bool secureActive; // injecting via the agent because this PC's sign-in screen is up
+
+    /// <summary>
+    /// Controlled side: if this PC switched to a secure desktop (sign-in prompt), our input can't reach it.
+    /// Hand control straight back instead of leaving the other PC's mouse and keyboard stuck here.
+    /// </summary>
+    bool SecureDesktopBlocks(Link l)
+    {
+        long now = Environment.TickCount64;
+        if (now < nextDesktopCheck) return false;
+        nextDesktopCheck = now + 200;
+        if (Native.InputDesktopReachable()) { secureActive = false; return false; }
+        // Secure desktop is up. If the user installed sign-in support, keep going through the agent.
+        if (settings.SignInSupport && secure.TryConnect()) { secureActive = true; return false; }
+        // Otherwise hand control straight back so the other PC's mouse and keyboard aren't stuck here.
+        secureActive = false;
+        controlled = false;
+        ReleaseInjected();
+        l.Send(Wire.Build(Msg.Locked));
+        ThreadPool.QueueUserWorkItem(_ => Fire());
+        return true;
+    }
     long cooldownUntil;
 
     public Engine(Settings settings)
     {
         this.settings = settings;
         EnsureLayout(announce: false);
-        hook = new InputHook(OnMouse, OnKey);
+        hook = new InputHook(OnMouse, OnKey, OnMoveSize);
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaysChanged;
     }
 
@@ -263,6 +287,7 @@ sealed class Engine : IDisposable
             return;
         }
 
+        StartShare();
         Phase = Phase.Searching; Fire();
         _ = Task.Run(() => AcceptLoop(ct));
         _ = Task.Run(() => DataAcceptLoop(ct));
@@ -278,6 +303,7 @@ sealed class Engine : IDisposable
         try { dataListener?.Dispose(); } catch { }
         try { udp?.Dispose(); } catch { }
         listener = null; dataListener = null; udp = null;
+        StopShare();
         Phase = Phase.Stopped;
         link?.Dispose();
         link = null;
@@ -293,6 +319,7 @@ sealed class Engine : IDisposable
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaysChanged;
         Stop();
         hook.Dispose();
+        secure.Dispose();
     }
 
     // ======================== networking ========================
@@ -496,10 +523,16 @@ sealed class Engine : IDisposable
         UpdatePlaced();
         ResetInputState();
         AbortTransfers();
+        EndAllStreams();
         Clipboard?.ClearOffer();
         if (Phase == Phase.Connected) Phase = Phase.Searching;
         Fire();
     }
+
+    void InjMove(int x, int y) { if (secureActive) secure.Move(x, y); else Inject.MoveTo(x, y); }
+    void InjButton(int b, bool down) { if (secureActive) secure.Button(b, down); else Inject.Button(b, down); }
+    void InjWheel(short delta, bool horizontal) { if (secureActive) secure.Wheel(delta, horizontal); else Inject.Wheel(delta, horizontal); }
+    void InjKey(ushort vk, ushort scan, bool ext, bool down) { if (secureActive) secure.Key(vk, scan, ext, down); else Inject.Key(vk, scan, ext, down); }
 
     void ResetInputState()
     {
@@ -514,8 +547,8 @@ sealed class Engine : IDisposable
     {
         lock (injectedKeys)
         {
-            foreach (var k in injectedKeys) Inject.Key(k.vk, k.scan, k.ext, false);
-            foreach (var b in injectedButtons) Inject.Button(b, false);
+            foreach (var k in injectedKeys) InjKey(k.vk, k.scan, k.ext, false);
+            foreach (var b in injectedButtons) InjButton(b, false);
             injectedKeys.Clear();
             injectedButtons.Clear();
         }
@@ -525,6 +558,8 @@ sealed class Engine : IDisposable
 
     bool OnMouse(int msg, in Native.MSLLHOOKSTRUCT m)
     {
+        if (msg == Native.WM_MOUSEMOVE) SampleDrag(m.pt.X, m.pt.Y);
+        if (manualDrag != 0) ManualDragStep(msg, m.pt.X, m.pt.Y);
         if (m.extra == Inject.Magic) return false;
         var l = link;
 
@@ -534,6 +569,9 @@ sealed class Engine : IDisposable
             switch (msg)
             {
                 case Native.WM_MOUSEMOVE:
+                    // Movement is the offset from where the hidden cursor was last left (centre, or wherever window-
+                    // sharing injection moved it). Then snap it back to the centre so it never drifts into a screen
+                    // edge (where Windows would clamp it and swallow further movement) and the next delta stays clean.
                     short dx = (short)Math.Clamp(m.pt.X - pin.X, -32000, 32000), dy = (short)Math.Clamp(m.pt.Y - pin.Y, -32000, 32000);
                     if (dx != 0 || dy != 0)
                     {
@@ -541,6 +579,8 @@ sealed class Engine : IDisposable
                         movesSent++;
                         l.Send(Wire.Build(Msg.Move, w => { w.Write(dx); w.Write(dy); }));
                     }
+                    Native.SetCursorPos(pinHome.X, pinHome.Y);
+                    pin = pinHome;
                     return true;
                 case Native.WM_MOUSEWHEEL:
                 case Native.WM_MOUSEHWHEEL:
@@ -573,9 +613,19 @@ sealed class Engine : IDisposable
         }
 
         if (l != null && settings.ShareInput && settings.EdgeSwitch && PeerMonitors.Length > 0 && Environment.TickCount64 > cooldownUntil
-            && !AnyMouseButtonDown() && Screens.Crossing(Screens.Monitors, peerPlaced, m.pt.X, m.pt.Y) is (int X, int Y) p)
+            && Screens.Crossing(Screens.Monitors, peerPlaced, m.pt.X, m.pt.Y) is (int X, int Y) p)
         {
+            var dragged = DraggedWindow();
+            if (dragged == 0 && AnyMouseButtonDown()) return false;
             GoToPeer(l, (p.X - settings.PeerOffsetX, p.Y - settings.PeerOffsetY));
+            if (dragged != 0)
+            {
+                // Dragging a window across: it goes along. Keep the held button so letting go drops it over there.
+                movingHwnd = 0;
+                lock (forwardedKeys) forwardedButtons.Add(0);
+                manualDrag = 0;
+                if (HandDraggedToPeer(l, dragged, m.pt.X, m.pt.Y)) OnInjector(InjectEscape); // never inject from the hook thread
+            }
             return true;
         }
         return false;
@@ -587,7 +637,7 @@ sealed class Engine : IDisposable
         Native.GetCursorPos(out var cur);
         // Park the (hidden) cursor mid-screen: at the edge, Windows would clip away any motion toward that edge.
         var mon = Screens.At(Screens.Monitors, cur.X, cur.Y) ?? Screens.Nearest(Screens.Monitors, cur.X, cur.Y);
-        pin = new Native.POINT { X = mon.Left + mon.Width / 2, Y = mon.Top + mon.Height / 2 };
+        pin = pinHome = new Native.POINT { X = mon.Left + mon.Width / 2, Y = mon.Top + mon.Height / 2 };
         lock (forwardedKeys) { forwardedKeys.Clear(); forwardedButtons.Clear(); }
         movesSent = 0;
         float myScale = (float)Screens.ScaleAt(pin.X, pin.Y);
@@ -757,6 +807,7 @@ sealed class Engine : IDisposable
 
             case Msg.Enter:
                 if (!settings.ShareInput) break;
+                nextDesktopCheck = 0;
                 bool center = r.ReadBoolean();
                 int ex = r.ReadInt32(), ey = r.ReadInt32();
                 peerAllowsEdgeReturn = r.ReadBoolean();
@@ -771,13 +822,14 @@ sealed class Engine : IDisposable
                 else (rx, ry) = Screens.ClampOnto(Screens.Monitors, ex, ey, 1);
                 movesApplied = 0;
                 controlled = true;
-                Inject.MoveTo(rx, ry);
+                if (SecureDesktopBlocks(l)) break;
+                InjMove(rx, ry);
                 CursorHider.Set(false);
                 Fire();
                 break;
 
             case Msg.Move:
-                if (!controlled) break;
+                if (!controlled || SecureDesktopBlocks(l)) break;
                 double f = Screens.ScaleAt(rx, ry) / senderScale;
                 double mx = r.ReadInt16() * f + carryX, my = r.ReadInt16() * f + carryY;
                 int ix = (int)Math.Round(mx), iy = (int)Math.Round(my);
@@ -789,10 +841,17 @@ sealed class Engine : IDisposable
                     // Off our screens. If that spot is one of the controller's screens, hand the cursor back there.
                     if (peerAllowsEdgeReturn && Screens.At(peerPlaced, nx, ny) != null)
                     {
+                        var dragged = DraggedWindow();
                         controlled = false;
-                        ReleaseInjected();
                         int bx = nx - settings.PeerOffsetX, by = ny - settings.PeerOffsetY, applied = movesApplied;
                         l.Send(Wire.Build(Msg.Return, w => { w.Write(bx); w.Write(by); w.Write(applied); }));
+                        if (dragged != 0)
+                        {
+                            movingHwnd = 0;
+                            manualDrag = 0;
+                            if (HandDraggedToPeer(l, dragged, rx, ry)) InjectEscape();
+                        }
+                        ReleaseInjected();
                         CursorHider.Set(true); // cursor left this PC
                         ThreadPool.QueueUserWorkItem(_ => Fire());
                         break;
@@ -800,33 +859,47 @@ sealed class Engine : IDisposable
                     (nx, ny) = Screens.Clamp(nx, ny);
                 }
                 (rx, ry) = (nx, ny);
-                Inject.MoveTo(rx, ry);
+                InjMove(rx, ry);
                 break;
 
             case Msg.Button:
                 if (!controlled) break;
+                nextDesktopCheck = 0; // a click is what usually opens the sign-in prompt: check right away next time
                 int b = r.ReadByte(); bool bd = r.ReadBoolean();
                 lock (injectedKeys) { if (bd) injectedButtons.Add(b); else injectedButtons.Remove(b); }
-                Inject.Button(b, bd);
+                InjButton(b, bd);
                 break;
 
             case Msg.Wheel:
                 if (!controlled) break;
                 short delta = r.ReadInt16();
-                Inject.Wheel(delta, r.ReadBoolean());
+                InjWheel(delta, r.ReadBoolean());
                 break;
 
             case Msg.Key:
-                if (!controlled) break;
+                if (!controlled || SecureDesktopBlocks(l)) break;
                 ushort vk = r.ReadUInt16(), scan = r.ReadUInt16(); bool ext = r.ReadBoolean(), kd = r.ReadBoolean();
                 lock (injectedKeys) { if (kd) injectedKeys.Add((vk, scan, ext)); else injectedKeys.Remove((vk, scan, ext)); }
-                Inject.Key(vk, scan, ext, kd);
+                InjKey(vk, scan, ext, kd);
                 break;
 
             case Msg.Return:
                 int hx = r.ReadInt32(), hy = r.ReadInt32();
                 int peerApplied = r.BaseStream.Position < r.BaseStream.Length ? r.ReadInt32() : -1;
                 ComeHome((hx, hy), peerApplied);
+                break;
+
+            case Msg.Locked:
+                if (controlling)
+                {
+                    controlling = false;
+                    cooldownUntil = Environment.TickCount64 + 1500; // don't slide straight back onto the locked screen
+                    lock (forwardedKeys) { forwardedKeys.Clear(); forwardedButtons.Clear(); }
+                    Native.SetCursorPos(pinHome.X, pinHome.Y);
+                    CursorHider.Set(false);
+                    Fire();
+                }
+                Notify?.Invoke($"{PeerName} is showing its sign-in screen. Windows only lets you type the PIN with that PC's own keyboard.");
                 break;
 
             case Msg.Yield:
@@ -838,6 +911,10 @@ sealed class Engine : IDisposable
                 controlled = false;
                 ReleaseInjected();
                 Fire();
+                break;
+
+            default:
+                OnShareMessage(l, type, r);
                 break;
 
             case Msg.Offer:

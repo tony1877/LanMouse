@@ -12,6 +12,11 @@ Share one mouse, keyboard and clipboard between two Windows PCs on the same netw
 - **Clipboard on paste:** text, pictures, files and folders. Copying only sends a description; the data moves when you actually paste, over its own connection so it never slows down your mouse and keyboard.
 - **Automatic pairing:** type the same pairing key on both PCs and they find each other.
 - **Encrypted:** AES-GCM with a key derived from the pairing key.
+- **Sign-in screen control (optional):** install a small privileged helper so you can type your PIN/password on the other PC's Windows sign-in screen. Off by default; enable it in Settings. See the security note there.
+
+## Experimental: window sharing (buggy)
+
+Dragging a window across to the other PC (it streams as a live view over UDP, port 47826) is **work in progress and still buggy as hell**. Expect the dragged window to misbehave: contents may not render, the cursor can jump, and dragging/resizing is unreliable. It needs real two-machine testing and more work. Turn it off with the **Drag windows to the other PC** switch in Settings if it gets in the way. Everything else above (mouse, keyboard, clipboard, sign-in) is solid.
 
 ## Download
 
