@@ -36,3 +36,7 @@ dotnet publish -c Release -o release
 ```
 
 The single-file app ends up in `release\LanMouse.exe`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
