@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -18,23 +19,40 @@ public enum Phase { Stopped, Starting, Searching, Connected }
 [Flags]
 enum ClipKinds : byte { None = 0, Text = 1, Image = 2, Files = 4 }
 
-/// <summary>What the other PC has on its clipboard. Nothing is transferred until it is actually pasted.</summary>
-sealed record ClipOffer(int Id, ClipKinds Kinds, string Summary);
+/// <summary>What another PC has on its clipboard. Nothing is transferred until it is actually pasted.</summary>
+sealed record ClipOffer(string PeerId, int Id, ClipKinds Kinds, string Summary);
 
 interface IClipboardSink
 {
-    /// <summary>The peer copied something: advertise it on our clipboard without fetching it.</summary>
+    /// <summary>A PC copied something: advertise it on our clipboard without fetching it.</summary>
     void ApplyOffer(ClipOffer offer);
-    /// <summary>The peer is gone: drop anything we were advertising on its behalf.</summary>
-    void ClearOffer();
-    /// <summary>The peer is pasting our offer #id: return string (text), byte[] (PNG) or string[] (file paths), or null if it changed.</summary>
+    /// <summary>That PC is gone: drop anything we were advertising on its behalf.</summary>
+    void ClearOffer(string peerId);
+    /// <summary>A PC is pasting our offer #id: return string (text), byte[] (PNG) or string[] (file paths), or null if it changed.</summary>
     object? ReadForPeer(int id, ClipKinds kind);
 }
+
+/// <summary>One connected PC.</summary>
+sealed class Peer
+{
+    public Peer(Link link) { Link = link; }
+    public Link Link { get; }
+    public string Id => Link.PeerId;
+    public string Name { get; set; } = "";
+    public string Address => Link.Address;
+    public Screens.Bounds[] Monitors { get; set; } = Array.Empty<Screens.Bounds>();
+    /// <summary>Runs a version that understands multi-PC arrangements.</summary>
+    public bool Modern { get; set; }
+    public void Send(byte[] msg) => Link.Send(msg);
+}
+
+/// <summary>A PC as the UI draws it.</summary>
+sealed record PcView(string Id, string Name, int Number, bool IsSelf, bool Online, bool Known, Screens.Bounds[] Monitors, (int X, int Y) Pos);
 
 sealed partial class Engine : IDisposable
 {
     public const int TcpPort = 47823, UdpPort = 47824, DataPort = 47825;
-    const byte Protocol = 4;
+    const byte Protocol = 5; // 5 = any number of PCs
     public static readonly string ReceiveDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "LAN Mouse");
 
@@ -47,50 +65,52 @@ sealed partial class Engine : IDisposable
     Socket? listener, dataListener;
     UdpClient? udp;
     byte[] master = Array.Empty<byte>(), discoveryKey = Array.Empty<byte>();
-    volatile Link? link;
-    int connecting;
+    readonly ConcurrentDictionary<string, Peer> peers = new();
+    readonly HashSet<string> dialing = new();
     readonly HashSet<Link> transfers = new();
 
     // -- observable state (read by UI) --
     public Phase Phase { get; private set; }
-    public string PeerName { get; private set; } = "";
-    /// <summary>The other PC's monitor rectangles in its own coordinates (empty until it tells us).</summary>
-    public Screens.Bounds[] PeerMonitors { get; private set; } = Array.Empty<Screens.Bounds>();
-    public string PeerAddress => link?.Address ?? "";
     public string? Warning { get; private set; }
-    public bool Controlling => controlling;
-    public bool Controlled => controlled;
+    public bool Controlling => target != null;
+    public bool Controlled => controller != null;
+    public string ControllingName => target?.Name ?? "";
+    public string ControlledByName => controller?.Name ?? "";
+    public string? ControllingId => target?.Id;
+    public IReadOnlyList<Peer> Peers => peers.Values.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase).ToList();
     public event Action? Changed;
     public event Action<string>? Notify;
     public event Action<string?, double>? Progress;
 
     // -- input state --
-    volatile bool controlling, controlled;
+    volatile Peer? target;       // the PC our mouse and keyboard currently drive (null = this PC)
+    volatile Peer? controller;   // the PC driving us right now (null = nobody)
     Native.POINT pin, pinHome;
     readonly HashSet<uint> forwardedKeys = new();
     readonly HashSet<int> forwardedButtons = new();
     readonly HashSet<(ushort vk, ushort scan, bool ext)> injectedKeys = new();
     readonly HashSet<int> injectedButtons = new();
     int rx, ry;
-    bool peerAllowsEdgeReturn = true;
-    // Moves sent while controlling, so the ones still in flight when the peer hands the cursor back aren't lost.
+    bool controllerAllowsEdge = true;
+    // Moves sent while controlling, so the ones still in flight when a PC hands the cursor on aren't lost.
     readonly (short dx, short dy)[] sentMoves = new (short, short)[1024];
     int movesSent, movesApplied;
-    // Display scaling: movement is converted so the pointer covers the same visual distance on both PCs.
+    // Display scaling: movement is converted so the pointer covers the same visual distance on every PC.
     double senderScale = 1, carryX, carryY;
     long nextDesktopCheck;
     readonly SecureInput secure = new();
     volatile bool secureActive;   // injecting via the SYSTEM agent (sign-in screen, or an elevated app blocks us)
     volatile bool inputBlocked;   // input can't reach the foreground (secure desktop or elevated app) without the agent
+    long cooldownUntil;
 
     /// <summary>
     /// Controlled side: decide how to deliver input. Normal apps take direct SendInput. The secure sign-in screen,
     /// and elevated foreground apps like Task Manager (which Windows stops ordinary input from reaching), are routed
     /// through the SYSTEM agent when the user installed sign-in support. Only the unreachable sign-in screen with no
-    /// agent forces control back to the other PC; a merely-blocked elevated app does not (that would feel like a
-    /// random bounce). Returns true only when control was handed back.
+    /// agent forces control back; a merely-blocked elevated app does not (that would feel like a random bounce).
+    /// Returns true only when control was handed back.
     /// </summary>
-    bool SecureDesktopBlocks(Link l)
+    bool SecureDesktopBlocks(Peer from)
     {
         long now = Environment.TickCount64;
         if (now < nextDesktopCheck) return false;
@@ -98,29 +118,25 @@ sealed partial class Engine : IDisposable
         bool deskUnreachable = !Native.InputDesktopReachable();
         bool elevated = !deskUnreachable && Native.ForegroundInputBlocked();
         if (!deskUnreachable && !elevated) { secureActive = false; inputBlocked = false; return false; }
-        // Need the agent: route through it if available (it runs as SYSTEM and can reach both).
         if (settings.SignInSupport && secure.TryConnect()) { secureActive = true; inputBlocked = false; return false; }
         secureActive = false;
         inputBlocked = true;
         if (deskUnreachable)
         {
-            // Sign-in/secure desktop and no agent: hand control back so the cursor isn't stuck here.
-            controlled = false;
+            controller = null;
             ReleaseInjected();
-            l.Send(Wire.Build(Msg.Locked));
+            from.Send(Wire.Build(Msg.Locked));
             ThreadPool.QueueUserWorkItem(_ => Fire());
             return true;
         }
-        // An elevated app is swallowing our input and there's no agent: we can't control it, but stay put
-        // rather than bouncing back. Ctrl+Alt+<this PC> or Scroll Lock still brings the cursor home.
         return false;
     }
-    long cooldownUntil;
 
     public Engine(Settings settings)
     {
         this.settings = settings;
-        EnsureLayout(announce: false);
+        LoadWorld();
+        FixLayout(announce: false);
         hook = new InputHook(OnMouse, OnKey);
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaysChanged;
     }
@@ -129,101 +145,190 @@ sealed partial class Engine : IDisposable
 
     // ======================== arrangement ========================
 
-    static readonly Screens.Bounds[] Placeholder = { new(0, 0, 1920, 1080) };
+    World world = new();
+    readonly object worldGate = new();
 
-    /// <summary>The other PC's monitors (its own coordinates): live if connected, else as last seen, else a stand-in.</summary>
-    public Screens.Bounds[] PeerLayoutMonitors
+    string MyId => settings.Id;
+
+    void LoadWorld()
     {
-        get
+        lock (worldGate)
         {
-            if (PeerMonitors.Length > 0) return PeerMonitors;
-            var cache = settings.PeerMonitorCache
-                .Where(a => a is { Length: 4 } && a[2] > 0 && a[3] > 0)
-                .Select(a => new Screens.Bounds(a[0], a[1], a[2], a[3])).ToArray();
-            return cache.Length > 0 ? cache : Placeholder;
+            world = new World { Stamp = settings.WorldStamp };
+            foreach (var (id, p) in settings.WorldPositions)
+                if (p is { Length: 2 }) world.Pos[id] = (p[0], p[1]);
         }
     }
 
-    public bool PeerMonitorsKnown => PeerMonitors.Length > 0 || settings.PeerMonitorCache.Length > 0;
-
-    /// <summary>Where the other PC's desktop starts, in this PC's screen coordinates.</summary>
-    public (int X, int Y) PeerOffset => (settings.PeerOffsetX, settings.PeerOffsetY);
-
-    /// <summary>The other PC's monitors placed into this PC's coordinates. Read by the hook thread.</summary>
-    volatile Screens.Bounds[] peerPlaced = Array.Empty<Screens.Bounds>();
-
-    void UpdatePlaced() => peerPlaced = Screens.Shift(PeerLayoutMonitors, settings.PeerOffsetX, settings.PeerOffsetY);
-
-    void SetOffset(int x, int y, long stamp)
+    void SaveWorld()
     {
-        settings.PeerOffsetX = x;
-        settings.PeerOffsetY = y;
-        settings.LayoutStamp = stamp;
-        settings.HasLayout = true;
+        settings.WorldPositions = world.Pos.ToDictionary(kv => kv.Key, kv => new[] { kv.Value.X, kv.Value.Y });
+        settings.WorldStamp = world.Stamp;
         settings.Save();
-        UpdatePlaced();
     }
 
-    /// <summary>Make sure there is an arrangement and that it still fits both PCs' current monitors.</summary>
-    void EnsureLayout(bool announce)
+    /// <summary>Monitors of any PC in its own coordinates: live if connected, else as last seen, else a stand-in.</summary>
+    Screens.Bounds[] MonitorsOf(string id)
     {
-        var mine = Screens.Monitors;
-        var other = PeerLayoutMonitors;
-        if (!settings.HasLayout)
+        if (id == MyId) return Screens.Monitors;
+        if (peers.TryGetValue(id, out var p) && p.Monitors.Length > 0) return p.Monitors;
+        if (settings.KnownPcs.TryGetValue(id, out var k))
         {
-            var (x, y) = Screens.Beside(mine, other, settings.Side);
-            SetOffset(x, y, 0);
+            var cache = k.Monitors.Where(a => a is { Length: 4 } && a[2] > 0 && a[3] > 0)
+                .Select(a => new Screens.Bounds(a[0], a[1], a[2], a[3])).ToArray();
+            if (cache.Length > 0) return cache;
         }
-        else if (!Screens.Valid(mine, Screens.Shift(other, settings.PeerOffsetX, settings.PeerOffsetY)))
+        return World.Placeholder;
+    }
+
+    bool MonitorsKnown(string id) =>
+        id == MyId || (peers.TryGetValue(id, out var p) && p.Monitors.Length > 0) ||
+        (settings.KnownPcs.TryGetValue(id, out var k) && k.Monitors.Length > 0);
+
+    string NameOf(string id) =>
+        id == MyId ? Environment.MachineName :
+        peers.TryGetValue(id, out var p) && p.Name != "" ? p.Name :
+        settings.KnownPcs.TryGetValue(id, out var k) && k.Name != "" ? k.Name : "Other PC";
+
+    /// <summary>Place PCs that have no spot yet and untangle overlaps. Tells everyone if it changed anything.</summary>
+    void FixLayout(bool announce)
+    {
+        bool changed;
+        lock (worldGate)
         {
-            var (x, y) = Screens.Snap(mine, other, settings.PeerOffsetX, settings.PeerOffsetY);
-            SetOffset(x, y, DateTime.UtcNow.Ticks);
-            if (announce) SendLayout();
+            var ids = new List<string> { MyId };
+            ids.AddRange(peers.Values.Where(p => p.Modern).Select(p => p.Id));
+            changed = world.Fix(ids, MonitorsOf);
+            if (changed) { world.Stamp = DateTime.UtcNow.Ticks; SaveWorld(); }
         }
-        else UpdatePlaced();
+        RebuildRoutes();
+        if (changed && announce) BroadcastLayout();
     }
 
-    void SendLayout()
+    byte[] LayoutMessage()
     {
-        long stamp = settings.LayoutStamp; int x = settings.PeerOffsetX, y = settings.PeerOffsetY;
-        link?.Send(Wire.Build(Msg.Layout, w => { w.Write(stamp); w.Write(x); w.Write(y); }));
+        World w;
+        lock (worldGate) w = world.Clone();
+        return Wire.Build(Msg.Layout, wr =>
+        {
+            wr.Write(w.Stamp);
+            wr.Write(w.Pos.Count);
+            foreach (var (id, p) in w.Pos) { wr.Write(id); wr.Write(p.X); wr.Write(p.Y); }
+        });
     }
 
-    /// <summary>User dragged the other PC to a new spot (this PC's coordinates). Snaps, saves and tells the peer.</summary>
-    public (int X, int Y) MovePeer(int wantX, int wantY)
+    void BroadcastLayout()
     {
-        var (x, y) = Screens.Snap(Screens.Monitors, PeerLayoutMonitors, wantX, wantY);
-        SetOffset(x, y, DateTime.UtcNow.Ticks);
-        SendLayout();
+        var msg = LayoutMessage();
+        foreach (var p in peers.Values) if (p.Modern) p.Send(msg);
+    }
+
+    /// <summary>Another PC's view of the arrangement. The newer one wins (ties go to the lower id); PCs it doesn't know about are kept.</summary>
+    void AdoptLayout(Peer from, BinaryReader r)
+    {
+        long stamp = r.ReadInt64();
+        int n = r.ReadInt32();
+        var theirs = new Dictionary<string, (int, int)>();
+        for (int i = 0; i < n && i < 64; i++) { var id = r.ReadString(); theirs[id] = (r.ReadInt32(), r.ReadInt32()); }
+        lock (worldGate)
+        {
+            bool newer = stamp > world.Stamp || (stamp == world.Stamp && string.CompareOrdinal(from.Id, MyId) < 0);
+            if (newer && theirs.Count > 0)
+            {
+                var keep = world.Pos.Where(kv => !theirs.ContainsKey(kv.Key)).ToList();
+                world.Pos.Clear();
+                foreach (var (id, p) in theirs) world.Pos[id] = p;
+                // PCs only we know about: re-place them next to the adopted arrangement if they now collide.
+                foreach (var (id, p) in keep) world.Pos[id] = p;
+                world.Stamp = stamp;
+                SaveWorld();
+            }
+        }
+        FixLayout(announce: true);
         Fire();
-        return (x, y);
     }
 
-    /// <summary>The peer's view of the arrangement, if it is newer than ours (ties go to the lower id).</summary>
-    void AdoptLayout(long stamp, int peerX, int peerY, string peerId)
+    /// <summary>User dragged a PC to a new spot (world coordinates of its desktop origin). Snaps, saves and tells everyone.</summary>
+    public void MovePc(string id, int wantX, int wantY)
     {
-        bool theirs = !settings.HasLayout || stamp > settings.LayoutStamp ||
-                      (stamp == settings.LayoutStamp && string.CompareOrdinal(peerId, settings.Id) < 0);
-        if (theirs) SetOffset(-peerX, -peerY, stamp);
-        EnsureLayout(announce: true);
+        lock (worldGate)
+        {
+            if (!world.Pos.ContainsKey(id)) return;
+            world.Pos[id] = world.SnapPosition(id, wantX, wantY, MonitorsOf);
+            world.Stamp = DateTime.UtcNow.Ticks;
+            SaveWorld();
+        }
+        RebuildRoutes();
+        BroadcastLayout();
+        Fire();
+    }
+
+    /// <summary>Drop PCs that aren't connected from the arrangement (and forget them).</summary>
+    public void ForgetOffline()
+    {
+        lock (worldGate)
+        {
+            foreach (var id in world.Pos.Keys.ToList())
+                if (id != MyId && !peers.ContainsKey(id)) { world.Pos.Remove(id); settings.KnownPcs.Remove(id); }
+            world.Stamp = DateTime.UtcNow.Ticks;
+            SaveWorld();
+        }
+        FixLayout(announce: false);
+        BroadcastLayout();
+        Fire();
+    }
+
+    /// <summary>Every PC in the arrangement, numbered, for drawing.</summary>
+    public List<PcView> LayoutView()
+    {
+        lock (worldGate)
+        {
+            var order = world.Numbered(MonitorsOf);
+            return order.Select((id, i) => new PcView(id, NameOf(id), i + 1, id == MyId, id == MyId || peers.ContainsKey(id),
+                MonitorsKnown(id), world.Placed(id, MonitorsOf), world.Pos[id])).ToList();
+        }
+    }
+
+    public int MyNumber => LayoutView().FirstOrDefault(v => v.IsSelf)?.Number ?? 1;
+
+    /// <summary>What the hook thread needs, precomputed: our monitors and every reachable PC's monitors in OUR coordinates.</summary>
+    sealed record Route(Peer Peer, Screens.Bounds[] Mons, int Dx, int Dy);
+    volatile Route[] routes = Array.Empty<Route>();
+    volatile string[] numbered = Array.Empty<string>();
+
+    void RebuildRoutes()
+    {
+        lock (worldGate)
+        {
+            if (!world.Pos.TryGetValue(MyId, out var me)) me = (0, 0);
+            var list = new List<Route>();
+            foreach (var p in peers.Values)
+            {
+                if (!p.Modern || p.Monitors.Length == 0 || !world.Pos.TryGetValue(p.Id, out var pos)) continue;
+                int dx = pos.X - me.X, dy = pos.Y - me.Y;
+                list.Add(new Route(p, Screens.Shift(p.Monitors, dx, dy), dx, dy));
+            }
+            routes = list.ToArray();
+            numbered = world.Numbered(MonitorsOf).ToArray();
+        }
     }
 
     void OnDisplaysChanged(object? sender, EventArgs e)
     {
         Screens.Refresh();
-        link?.Send(Wire.Build(Msg.Screens, WriteMonitors));
-        EnsureLayout(announce: true);
+        var msg = Wire.Build(Msg.Screens, WriteMonitors);
+        foreach (var p in peers.Values) p.Send(msg);
+        FixLayout(announce: true);
         Fire();
     }
 
-    void SetPeerMonitors(Screens.Bounds[] mons)
+    void SetPeerMonitors(Peer p, Screens.Bounds[] mons)
     {
-        PeerMonitors = mons;
-        if (mons.Length > 0)
-        {
-            settings.PeerMonitorCache = mons.Select(m => new[] { m.Left, m.Top, m.Width, m.Height }).ToArray();
-            settings.Save();
-        }
+        p.Monitors = mons;
+        if (!settings.KnownPcs.TryGetValue(p.Id, out var k)) settings.KnownPcs[p.Id] = k = new KnownPc();
+        if (p.Name != "") k.Name = p.Name;
+        if (mons.Length > 0) k.Monitors = mons.Select(m => new[] { m.Left, m.Top, m.Width, m.Height }).ToArray();
+        settings.Save();
     }
 
     static void WriteMonitors(BinaryWriter w)
@@ -246,23 +351,6 @@ sealed partial class Engine : IDisposable
         return list.ToArray();
     }
 
-    /// <summary>PC numbers follow the arrangement: 1 = the left (or upper) PC, 2 = the other.</summary>
-    public int MyNumber
-    {
-        get
-        {
-            var mb = Screens.Box(Screens.Monitors);
-            var placed = peerPlaced;
-            if (placed.Length == 0) return 1;
-            var pb = Screens.Box(placed);
-            double dx = pb.Left + pb.Width / 2.0 - (mb.Left + mb.Width / 2.0);
-            double dy = pb.Top + pb.Height / 2.0 - (mb.Top + mb.Height / 2.0);
-            bool peerFirst = Math.Abs(dx) >= Math.Abs(dy) ? dx < 0 : dy < 0;
-            return peerFirst ? 2 : 1;
-        }
-    }
-    public int PeerNumber => 3 - MyNumber;
-
     // ======================== lifecycle ========================
 
     public async Task StartAsync()
@@ -283,10 +371,10 @@ sealed partial class Engine : IDisposable
         {
             listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             listener.Bind(new IPEndPoint(IPAddress.Any, TcpPort));
-            listener.Listen(4);
+            listener.Listen(16);
             dataListener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             dataListener.Bind(new IPEndPoint(IPAddress.Any, DataPort));
-            dataListener.Listen(8);
+            dataListener.Listen(16);
             udp = new UdpClient();
             udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             udp.EnableBroadcast = true;
@@ -316,11 +404,10 @@ sealed partial class Engine : IDisposable
         try { udp?.Dispose(); } catch { }
         listener = null; dataListener = null; udp = null;
         Phase = Phase.Stopped;
-        link?.Dispose();
-        link = null;
-        PeerMonitors = Array.Empty<Screens.Bounds>();
+        foreach (var p in peers.Values) { p.Link.Closed -= OnClosed; p.Link.Dispose(); Clipboard?.ClearOffer(p.Id); }
+        peers.Clear();
+        RebuildRoutes();
         AbortTransfers();
-        Clipboard?.ClearOffer();
         ResetInputState();
         Fire();
     }
@@ -350,7 +437,7 @@ sealed partial class Engine : IDisposable
 
     void Hint(string text)
     {
-        if (link != null || Warning == text) return;
+        if (!peers.IsEmpty || Warning == text) return;
         Warning = text;
         Fire();
     }
@@ -361,6 +448,9 @@ sealed partial class Engine : IDisposable
         catch { return false; }
     }
 
+    IEnumerable<string> ManualAddresses() =>
+        settings.PeerAddress.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
     async Task AnnounceLoop(CancellationToken ct)
     {
         searchStarted = Environment.TickCount64;
@@ -368,22 +458,19 @@ sealed partial class Engine : IDisposable
         var id = Convert.FromHexString(settings.Id);
         while (!ct.IsCancellationRequested)
         {
-            if (link == null)
+            // Keep announcing even when connected: a third PC may join at any time.
+            var packet = DiscoveryPacket(id, Bucket());
+            foreach (var t in BroadcastTargets())
             {
-                var packet = DiscoveryPacket(id, Bucket());
-                foreach (var target in BroadcastTargets())
-                {
-                    try { await udp!.SendAsync(packet, new IPEndPoint(target, UdpPort), ct); } catch { }
-                }
-                if (lastHeard == 0 && Environment.TickCount64 - searchStarted > 8000 && Warning == null)
-                    Hint("Nothing heard from another LAN Mouse yet. Make sure LanMouse.exe is running there with Connect pressed, then click \"Allow through firewall\" on BOTH PCs. If it still fails, type the other PC's IP below.");
-                if (!string.IsNullOrWhiteSpace(settings.PeerAddress))
-                    _ = Task.Run(() => Connect(settings.PeerAddress.Trim()));
+                try { await udp!.SendAsync(packet, new IPEndPoint(t, UdpPort), ct); } catch { }
             }
-            else
-            {
-                link.Send(Wire.Build(Msg.Ping));
-            }
+            if (peers.IsEmpty && lastHeard == 0 && Environment.TickCount64 - searchStarted > 8000 && Warning == null)
+                Hint("Nothing heard from another LAN Mouse yet. Make sure LanMouse.exe is running there with Connect pressed, then click \"Allow through firewall\" on EVERY PC. If it still fails, type the other PC's IP in Settings.");
+            var connectedAddrs = peers.Values.Select(p => p.Address).ToHashSet();
+            foreach (var host in ManualAddresses())
+                if (!connectedAddrs.Contains(host)) _ = Task.Run(() => Connect(host));
+            var ping = Wire.Build(Msg.Ping);
+            foreach (var p in peers.Values) p.Send(ping);
             try { await Task.Delay(2000, ct); } catch { return; }
         }
     }
@@ -448,8 +535,8 @@ sealed partial class Engine : IDisposable
             }
             if (p.Length != 36 || !p.AsSpan(0, 4).SequenceEqual("LMD3"u8)) continue;
             var peerId = p.AsSpan(4, 16).ToArray();
-            int cmp = myId.AsSpan().SequenceCompareTo(peerId);
-            if (cmp == 0 || link != null) continue;
+            if (myId.AsSpan().SequenceEqual(peerId)) continue;
+            if (peers.ContainsKey(Convert.ToHexString(peerId).ToLowerInvariant())) continue;
             long now = Bucket();
             bool valid = false;
             for (long b = now - 1; b <= now + 1 && !valid; b++)
@@ -466,7 +553,7 @@ sealed partial class Engine : IDisposable
 
     async Task Connect(string host)
     {
-        if (link != null || Interlocked.Exchange(ref connecting, 1) == 1) return;
+        lock (dialing) if (!dialing.Add(host)) return;
         try
         {
             var s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -480,7 +567,7 @@ sealed partial class Engine : IDisposable
             }
             Establish(s, initiator: true);
         }
-        finally { Volatile.Write(ref connecting, 0); }
+        finally { lock (dialing) dialing.Remove(host); }
     }
 
     void Establish(Socket s, bool initiator)
@@ -489,54 +576,74 @@ sealed partial class Engine : IDisposable
         var l = Link.Handshake(s, settings.Id, master, initiator);
         if (l == null)
         {
-            Hint("Reached the other PC, but the pairing keys don't match.");
+            Hint("Reached another PC, but the pairing keys don't match.");
             return;
         }
 
-        Link? old;
+        var peer = new Peer(l);
+        Peer? old;
         lock (gate)
         {
-            old = link;
-            if (cts == null || (old != null && !(l.InitiatedByLowerId && !old.InitiatedByLowerId)))
+            peers.TryGetValue(l.PeerId, out old);
+            // Two connections to the same PC (both dialed): both sides keep the one the lower id opened.
+            if (cts == null || (old != null && !(l.InitiatedByLowerId && !old.Link.InitiatedByLowerId)))
             {
                 l.Dispose();
                 return;
             }
-            link = l;
+            peers[l.PeerId] = peer;
         }
-        if (old != null) { old.Closed -= OnClosed; old.Dispose(); }
-        ResetInputState();
+        if (old != null) { old.Link.Closed -= OnClosed; old.Link.Dispose(); PeerGone(old); }
         l.Message += OnMessage;
         l.Closed += OnClosed;
         l.Start();
-        bool hasLayout = settings.HasLayout;
-        long stamp = settings.LayoutStamp; int ox = settings.PeerOffsetX, oy = settings.PeerOffsetY;
         l.Send(Wire.Build(Msg.Hello, w =>
         {
             w.Write((byte)settings.Side); // v3 peers read this first
             w.Write(Environment.MachineName);
             WriteMonitors(w);
             w.Write(Protocol);
-            w.Write(hasLayout); w.Write(stamp); w.Write(ox); w.Write(oy);
+            w.Write(false); w.Write(0L); w.Write(0); w.Write(0); // v4 two-PC layout fields (unused)
         }));
-        Phase = Phase.Connected; Warning = null; PeerName = l.Address;
+        l.Send(LayoutMessage());
+        Phase = Phase.Connected; Warning = null;
+        peer.Name = l.Address;
         Fire();
     }
 
+    Peer? PeerOf(Link l) => peers.TryGetValue(l.PeerId, out var p) && p.Link == l ? p : null;
+
     void OnClosed(Link l)
     {
+        Peer? p;
         lock (gate)
         {
-            if (link != l) return;
-            link = null;
+            if (!peers.TryGetValue(l.PeerId, out p) || p.Link != l) return;
+            peers.TryRemove(l.PeerId, out _);
         }
-        PeerMonitors = Array.Empty<Screens.Bounds>();
-        UpdatePlaced();
-        ResetInputState();
-        AbortTransfers();
-        Clipboard?.ClearOffer();
-        if (Phase == Phase.Connected) Phase = Phase.Searching;
+        PeerGone(p);
+        if (peers.IsEmpty && Phase == Phase.Connected) Phase = Phase.Searching;
         Fire();
+    }
+
+    /// <summary>A PC disconnected (or its connection was replaced): make sure nothing is left pointing at it.</summary>
+    void PeerGone(Peer p)
+    {
+        RebuildRoutes();
+        Clipboard?.ClearOffer(p.Id);
+        if (target == p)
+        {
+            target = null;
+            Native.SetCursorPos(pinHome.X, pinHome.Y);
+            CursorHider.Set(false);
+            lock (forwardedKeys) { forwardedKeys.Clear(); forwardedButtons.Clear(); }
+        }
+        if (controller == p)
+        {
+            controller = null;
+            ReleaseInjected();
+        }
+        if (peers.IsEmpty) AbortTransfers();
     }
 
     void InjMove(int x, int y) { if (secureActive) secure.Move(x, y); else Inject.MoveTo(x, y); }
@@ -546,8 +653,8 @@ sealed partial class Engine : IDisposable
 
     void ResetInputState()
     {
-        controlling = false;
-        controlled = false;
+        target = null;
+        controller = null;
         secureActive = false;
         inputBlocked = false;
         CursorHider.Set(false);
@@ -575,11 +682,10 @@ sealed partial class Engine : IDisposable
     bool OnMouse(int msg, in Native.MSLLHOOKSTRUCT m)
     {
         if (m.extra == Inject.Magic) return false;
-        var l = link;
+        var t = target;
 
-        if (controlling)
+        if (t != null)
         {
-            if (l == null) { controlling = false; return false; }
             switch (msg)
             {
                 case Native.WM_MOUSEMOVE:
@@ -590,7 +696,7 @@ sealed partial class Engine : IDisposable
                     {
                         sentMoves[movesSent & 1023] = (dx, dy);
                         movesSent++;
-                        l.Send(Wire.Build(Msg.Move, w => { w.Write(dx); w.Write(dy); }));
+                        t.Send(Wire.Build(Msg.Move, w => { w.Write(dx); w.Write(dy); }));
                     }
                     Native.SetCursorPos(pinHome.X, pinHome.Y);
                     pin = pinHome;
@@ -598,7 +704,7 @@ sealed partial class Engine : IDisposable
                 case Native.WM_MOUSEWHEEL:
                 case Native.WM_MOUSEHWHEEL:
                     short delta = unchecked((short)(m.mouseData >> 16));
-                    l.Send(Wire.Build(Msg.Wheel, w => { w.Write(delta); w.Write(msg == Native.WM_MOUSEHWHEEL); }));
+                    t.Send(Wire.Build(Msg.Wheel, w => { w.Write(delta); w.Write(msg == Native.WM_MOUSEHWHEEL); }));
                     return true;
             }
             int btn = ButtonOf(msg, m.mouseData, out bool down);
@@ -608,48 +714,61 @@ sealed partial class Engine : IDisposable
                 if (down) forwardedButtons.Add(btn);
                 else if (!forwardedButtons.Remove(btn)) return false; // pressed before switching: let it release here
             }
-            l.Send(Wire.Build(Msg.Button, w => { w.Write((byte)btn); w.Write(down); }));
+            t.Send(Wire.Build(Msg.Button, w => { w.Write((byte)btn); w.Write(down); }));
             return true;
         }
 
         if (msg != Native.WM_MOUSEMOVE || (m.flags & Native.LLMHF_INJECTED) != 0) return false;
         CursorHider.Set(false); // someone is using this PC's own mouse
 
-        if (controlled)
+        var c = controller;
+        if (c != null)
         {
             // You grabbed this PC's own mouse: take the cursor back.
-            controlled = false;
+            controller = null;
             ReleaseInjected();
-            l?.Send(Wire.Build(Msg.Yield));
-            Fire();
+            c.Send(Wire.Build(Msg.Yield));
+            ThreadPool.QueueUserWorkItem(_ => Fire());
             return false;
         }
 
-        if (l != null && settings.ShareInput && settings.EdgeSwitch && PeerMonitors.Length > 0 && Environment.TickCount64 > cooldownUntil
-            && Screens.Crossing(Screens.Monitors, peerPlaced, m.pt.X, m.pt.Y) is (int X, int Y) p)
+        if (settings.ShareInput && settings.EdgeSwitch && Environment.TickCount64 > cooldownUntil)
         {
-            if (AnyMouseButtonDown()) return false;
-            GoToPeer(l, (p.X - settings.PeerOffsetX, p.Y - settings.PeerOffsetY));
-            return true;
+            var mine = Screens.Monitors;
+            foreach (var r in routes)
+            {
+                if (Screens.Crossing(mine, r.Mons, m.pt.X, m.pt.Y) is not (int X, int Y) p) continue;
+                if (AnyMouseButtonDown()) return false;
+                GoTo(r.Peer, (p.X - r.Dx, p.Y - r.Dy));
+                return true;
+            }
         }
         return false;
     }
 
-    /// <summary>Hand mouse + keyboard to the peer. entry = landing point in the peer's coordinates; null = middle of its main screen (hotkey).</summary>
-    void GoToPeer(Link l, (int X, int Y)? entry)
+    /// <summary>
+    /// Drive PC <paramref name="q"/> with our mouse and keyboard. entry = landing point in q's coordinates;
+    /// null = middle of its main screen (hotkey). If we were driving another PC, it is released first.
+    /// </summary>
+    void GoTo(Peer q, (int X, int Y)? entry)
     {
-        Native.GetCursorPos(out var cur);
-        // Park the (hidden) cursor mid-screen: at the edge, Windows would clip away any motion toward that edge.
-        var mon = Screens.At(Screens.Monitors, cur.X, cur.Y) ?? Screens.Nearest(Screens.Monitors, cur.X, cur.Y);
-        pin = pinHome = new Native.POINT { X = mon.Left + mon.Width / 2, Y = mon.Top + mon.Height / 2 };
+        var old = target;
+        if (old != null && old != q) old.Send(Wire.Build(Msg.Release));
+        if (old == null)
+        {
+            Native.GetCursorPos(out var cur);
+            // Park the (hidden) cursor mid-screen: at the edge, Windows would clip away any motion toward that edge.
+            var mon = Screens.At(Screens.Monitors, cur.X, cur.Y) ?? Screens.Nearest(Screens.Monitors, cur.X, cur.Y);
+            pin = pinHome = new Native.POINT { X = mon.Left + mon.Width / 2, Y = mon.Top + mon.Height / 2 };
+            Native.SetCursorPos(pin.X, pin.Y);
+            CursorHider.Set(true);
+        }
         lock (forwardedKeys) { forwardedKeys.Clear(); forwardedButtons.Clear(); }
         movesSent = 0;
-        float myScale = (float)Screens.ScaleAt(pin.X, pin.Y);
-        controlling = true;
-        Native.SetCursorPos(pin.X, pin.Y);
-        CursorHider.Set(true);
+        float myScale = (float)Screens.ScaleAt(pinHome.X, pinHome.Y);
+        target = q;
         bool edgeReturn = settings.EdgeSwitch;
-        l.Send(Wire.Build(Msg.Enter, w =>
+        q.Send(Wire.Build(Msg.Enter, w =>
         {
             w.Write(entry == null);
             w.Write(entry?.X ?? 0); w.Write(entry?.Y ?? 0);
@@ -660,7 +779,7 @@ sealed partial class Engine : IDisposable
     }
 
     bool hotkeyDigitDown;
-    // Tracked here rather than via GetAsyncKeyState: while controlling the other PC we swallow
+    // Tracked here rather than via GetAsyncKeyState: while controlling another PC we swallow
     // Ctrl/Alt before Windows records them, so GetAsyncKeyState would say they're up and the
     // "come back" hotkey could never fire.
     bool ctrlL, ctrlR, altL, altR;
@@ -678,18 +797,25 @@ sealed partial class Engine : IDisposable
         }
     }
 
-    /// <summary>Ctrl+Alt+digit. Returns true if the key was consumed.</summary>
-    bool HandleHotkey(Link l, uint vk, bool down)
+    /// <summary>Ctrl+Alt+digit jumps to the PC with that number. Returns true if the key was consumed.</summary>
+    bool HandleHotkey(uint vk, bool down)
     {
         int digit = vk is >= 0x31 and <= 0x39 ? (int)vk - 0x30 : vk is >= 0x61 and <= 0x69 ? (int)vk - 0x60 : 0;
         if (digit == 0 || !settings.HotkeySwitch || !settings.ShareInput) return false;
         if (!down) { if (!hotkeyDigitDown) return false; hotkeyDigitDown = false; return true; }
-        bool ctrl = ctrlL || ctrlR, alt = altL || altR;
-        int me = MyNumber, peer = 3 - me;
-        if (!ctrl || !alt || (digit != me && digit != peer)) return false;
+        if (!(ctrlL || ctrlR) || !(altL || altR)) return false;
+        var order = numbered;
+        if (digit > order.Length) return false;
+        var id = order[digit - 1];
+        if (id == MyId)
+        {
+            hotkeyDigitDown = true;
+            if (target != null) ThreadPool.QueueUserWorkItem(_ => ComeHome(null));
+            return true;
+        }
+        if (!peers.TryGetValue(id, out var q) || !q.Modern) return false; // that PC is offline: let the key through
         hotkeyDigitDown = true;
-        if (digit == peer && !controlling) GoToPeer(l, null);
-        else if (digit == me && controlling) ThreadPool.QueueUserWorkItem(_ => ComeHome(null));
+        if (target != q) GoTo(q, null);
         return true;
     }
 
@@ -716,10 +842,10 @@ sealed partial class Engine : IDisposable
         if (k.extra == Inject.Magic) return false;
         bool down = msg is Native.WM_KEYDOWN or Native.WM_SYSKEYDOWN;
         TrackModifier(k.vkCode, down);
-        var l = link;
-        if (l == null) return false;
-        if (!controlled && HandleHotkey(l, k.vkCode, down)) return true;
-        if (!controlling) return false;
+        if (peers.IsEmpty) return false;
+        if (controller == null && HandleHotkey(k.vkCode, down)) return true;
+        var t = target;
+        if (t == null) return false;
 
         if (k.vkCode == VK_SCROLL)
         {
@@ -733,28 +859,25 @@ sealed partial class Engine : IDisposable
         }
         ushort vk = (ushort)k.vkCode, scan = (ushort)k.scanCode;
         bool ext = (k.flags & Native.LLKHF_EXTENDED) != 0;
-        l.Send(Wire.Build(Msg.Key, w => { w.Write(vk); w.Write(scan); w.Write(ext); w.Write(down); }));
+        t.Send(Wire.Build(Msg.Key, w => { w.Write(vk); w.Write(scan); w.Write(ext); w.Write(down); }));
         return true;
     }
 
-    /// <summary>Stop controlling the peer and put the cursor back on this PC. at = where it crossed back (this PC's coordinates).</summary>
-    void ComeHome((int X, int Y)? at, int peerApplied = -1)
+    /// <summary>Stop driving other PCs and put the cursor back on this one. at = where it arrives (this PC's coordinates).</summary>
+    void ComeHome((int X, int Y)? at)
     {
-        if (!controlling) return;
-        controlling = false;
+        var t = target;
+        if (t == null) return;
+        target = null;
         cooldownUntil = Environment.TickCount64 + 40;
         if (at is (int X, int Y) p)
         {
-            // Moves we sent after the peer decided to hand back never reached its cursor: apply them here.
-            int x = p.X, y = p.Y, sent = movesSent;
-            if (peerApplied >= 0 && sent - peerApplied is > 0 and <= 1024)
-                for (int i = peerApplied; i < sent; i++) { x += sentMoves[i & 1023].dx; y += sentMoves[i & 1023].dy; }
-            (x, y) = Screens.ClampOnto(Screens.Monitors, x, y, 3);
+            var (x, y) = Screens.ClampOnto(Screens.Monitors, p.X, p.Y, 3);
             Native.SetCursorPos(x, y);
         }
         else
         {
-            link?.Send(Wire.Build(Msg.Release));
+            t.Send(Wire.Build(Msg.Release));
             Native.SetCursorPos(pin.X, pin.Y);
         }
         CursorHider.Set(false);
@@ -764,57 +887,81 @@ sealed partial class Engine : IDisposable
 
     public void ReleaseControl() => ComeHome(null);
 
+    /// <summary>
+    /// The PC we were driving says the cursor left its screens at (lx,ly) in its coordinates. Work out whose screen that
+    /// is in the shared arrangement and continue there: this PC, a third PC, or (if nobody is there) back where it was.
+    /// </summary>
+    void OnReturn(Peer from, int lx, int ly, int fromApplied)
+    {
+        if (target != from) return;
+        (int X, int Y) fromPos, myPos;
+        lock (worldGate)
+        {
+            if (!world.Pos.TryGetValue(from.Id, out fromPos) || !world.Pos.TryGetValue(MyId, out myPos)) { ComeHome(null); return; }
+        }
+        int wx = lx + fromPos.X, wy = ly + fromPos.Y, sent = movesSent;
+        // Moves we sent after that PC decided to hand on never reached its cursor: apply them here.
+        if (fromApplied >= 0 && sent - fromApplied is > 0 and <= 1024)
+            for (int i = fromApplied; i < sent; i++) { wx += sentMoves[i & 1023].dx; wy += sentMoves[i & 1023].dy; }
+
+        string? owner;
+        lock (worldGate) owner = world.Owner(wx, wy, MonitorsOf);
+        if (owner == MyId) { ComeHome((wx - myPos.X, wy - myPos.Y)); return; }
+        if (owner != null && owner != from.Id && peers.TryGetValue(owner, out var q) && q.Modern)
+        {
+            (int X, int Y) qPos;
+            lock (worldGate) qPos = world.Pos[owner];
+            var entry = Screens.ClampOnto(q.Monitors.Length > 0 ? q.Monitors : World.Placeholder, wx - qPos.X, wy - qPos.Y, 2);
+            GoTo(q, entry);
+            return;
+        }
+        // Nobody reachable there: put it back on the PC it came from.
+        var back = Screens.ClampOnto(from.Monitors.Length > 0 ? from.Monitors : World.Placeholder, lx, ly, 2);
+        GoTo(from, back);
+    }
+
     // ======================== remote messages (reader thread) ========================
 
     void OnMessage(Link l, byte[] msg)
     {
+        var from = PeerOf(l);
+        if (from == null) return;
         var type = (Msg)msg[0];
         using var r = Wire.Read(msg);
         switch (type)
         {
             case Msg.Hello:
                 r.ReadByte(); // legacy side
-                PeerName = r.ReadString();
-                SetPeerMonitors(ReadMonitors(r));
-                bool modern = r.BaseStream.Position < r.BaseStream.Length && r.ReadByte() >= Protocol;
-                if (modern)
-                {
-                    bool peerHas = r.ReadBoolean();
-                    long stamp = r.ReadInt64(); int px = r.ReadInt32(), py = r.ReadInt32();
-                    if (peerHas) AdoptLayout(stamp, px, py, l.PeerId);
-                    else EnsureLayout(announce: true);
-                    if (!peerHas) SendLayout();
-                    Warning = null;
-                }
-                else
-                {
-                    EnsureLayout(announce: false);
-                    Warning = $"{PeerName} runs an older LAN Mouse. Install this version there too so screen arrangement and clipboard work.";
-                }
+                from.Name = r.ReadString();
+                SetPeerMonitors(from, ReadMonitors(r));
+                from.Modern = r.BaseStream.Position < r.BaseStream.Length && r.ReadByte() >= Protocol;
+                if (!from.Modern)
+                    Warning = $"{from.Name} runs an older LAN Mouse. Install this version on every PC so they can work together.";
+                FixLayout(announce: true);
                 Fire();
                 break;
 
             case Msg.Screens:
-                SetPeerMonitors(ReadMonitors(r));
-                EnsureLayout(announce: true);
+                SetPeerMonitors(from, ReadMonitors(r));
+                FixLayout(announce: true);
                 Fire();
                 break;
 
             case Msg.Layout:
-            {
-                long stamp = r.ReadInt64(); int px = r.ReadInt32(), py = r.ReadInt32();
-                if (stamp >= settings.LayoutStamp) SetOffset(-px, -py, stamp);
-                EnsureLayout(announce: true);
-                Fire();
+                if (from.Modern) AdoptLayout(from, r);
                 break;
-            }
 
             case Msg.Enter:
-                if (!settings.ShareInput) break;
+            {
+                if (!settings.ShareInput || !from.Modern) break;
+                // Someone else takes over: stop driving whatever we were driving, and tell a previous driver it lost us.
+                if (target != null) ComeHome(null);
+                var prev = controller;
+                if (prev != null && prev != from) prev.Send(Wire.Build(Msg.Yield));
                 nextDesktopCheck = 0;
                 bool center = r.ReadBoolean();
                 int ex = r.ReadInt32(), ey = r.ReadInt32();
-                peerAllowsEdgeReturn = r.ReadBoolean();
+                controllerAllowsEdge = r.ReadBoolean();
                 senderScale = r.BaseStream.Position + 4 <= r.BaseStream.Length ? Math.Clamp(r.ReadSingle(), 0.5f, 5f) : 1;
                 carryX = carryY = 0;
                 if (center)
@@ -826,15 +973,17 @@ sealed partial class Engine : IDisposable
                 else (rx, ry) = Screens.ClampOnto(Screens.Monitors, ex, ey, 1);
                 movesApplied = 0;
                 inputBlocked = false;
-                controlled = true;
-                if (SecureDesktopBlocks(l)) break;
+                controller = from;
+                if (SecureDesktopBlocks(from)) break;
                 InjMove(rx, ry);
                 CursorHider.Set(false);
                 Fire();
                 break;
+            }
 
             case Msg.Move:
-                if (!controlled || SecureDesktopBlocks(l)) break;
+            {
+                if (controller != from || SecureDesktopBlocks(from)) break;
                 double f = Screens.ScaleAt(rx, ry) / senderScale;
                 double mx = r.ReadInt16() * f + carryX, my = r.ReadInt16() * f + carryY;
                 int ix = (int)Math.Round(mx), iy = (int)Math.Round(my);
@@ -843,14 +992,14 @@ sealed partial class Engine : IDisposable
                 movesApplied++;
                 if (Screens.At(Screens.Monitors, nx, ny) == null)
                 {
-                    // Off our screens. If that spot is one of the controller's screens, hand the cursor back there.
-                    // Not while input is blocked with no agent: the real cursor is frozen (e.g. on Task Manager) and
-                    // our dead-reckoned position would march off the edge and bounce back for no reason.
-                    if ((secureActive || !inputBlocked) && peerAllowsEdgeReturn && Screens.At(peerPlaced, nx, ny) != null)
+                    // Off our screens. If another PC's screen is there in the arrangement, hand the cursor on (the
+                    // controlling PC decides where it goes). Not while input is blocked with no agent: the real cursor
+                    // is frozen (e.g. on Task Manager) and our dead-reckoned position would march off for no reason.
+                    if ((secureActive || !inputBlocked) && controllerAllowsEdge && SomeoneElseAt(nx, ny))
                     {
-                        controlled = false;
-                        int bx = nx - settings.PeerOffsetX, by = ny - settings.PeerOffsetY, applied = movesApplied;
-                        l.Send(Wire.Build(Msg.Return, w => { w.Write(bx); w.Write(by); w.Write(applied); }));
+                        controller = null;
+                        int applied = movesApplied;
+                        from.Send(Wire.Build(Msg.Return, w => { w.Write(nx); w.Write(ny); w.Write(applied); }));
                         ReleaseInjected();
                         CursorHider.Set(true); // cursor left this PC
                         ThreadPool.QueueUserWorkItem(_ => Fire());
@@ -861,9 +1010,10 @@ sealed partial class Engine : IDisposable
                 (rx, ry) = (nx, ny);
                 InjMove(rx, ry);
                 break;
+            }
 
             case Msg.Button:
-                if (!controlled) break;
+                if (controller != from) break;
                 nextDesktopCheck = 0; // a click is what usually opens the sign-in prompt: check right away next time
                 int b = r.ReadByte(); bool bd = r.ReadBoolean();
                 lock (injectedKeys) { if (bd) injectedButtons.Add(b); else injectedButtons.Remove(b); }
@@ -871,13 +1021,14 @@ sealed partial class Engine : IDisposable
                 break;
 
             case Msg.Wheel:
-                if (!controlled) break;
+                if (controller != from) break;
                 short delta = r.ReadInt16();
                 InjWheel(delta, r.ReadBoolean());
                 break;
 
             case Msg.Key:
-                if (!controlled || SecureDesktopBlocks(l)) break;
+            {
+                if (controller != from || SecureDesktopBlocks(from)) break;
                 ushort vk = r.ReadUInt16(), scan = r.ReadUInt16(); bool ext = r.ReadBoolean(), kd = r.ReadBoolean();
                 bool injWin;
                 lock (injectedKeys)
@@ -906,33 +1057,44 @@ sealed partial class Engine : IDisposable
                 }
                 InjKey(vk, scan, ext, kd);
                 break;
+            }
 
             case Msg.Return:
+            {
                 int hx = r.ReadInt32(), hy = r.ReadInt32();
-                int peerApplied = r.BaseStream.Position < r.BaseStream.Length ? r.ReadInt32() : -1;
-                ComeHome((hx, hy), peerApplied);
+                int applied = r.BaseStream.Position < r.BaseStream.Length ? r.ReadInt32() : -1;
+                OnReturn(from, hx, hy, applied);
                 break;
+            }
 
             case Msg.Locked:
-                if (controlling)
+                if (target == from)
                 {
-                    controlling = false;
+                    target = null;
                     cooldownUntil = Environment.TickCount64 + 1500; // don't slide straight back onto the locked screen
                     lock (forwardedKeys) { forwardedKeys.Clear(); forwardedButtons.Clear(); }
                     Native.SetCursorPos(pinHome.X, pinHome.Y);
                     CursorHider.Set(false);
                     Fire();
                 }
-                Notify?.Invoke($"{PeerName} is showing its sign-in screen. Windows only lets you type the PIN with that PC's own keyboard.");
+                Notify?.Invoke($"{from.Name} is showing its sign-in screen. Windows only lets you type the PIN with that PC's own keyboard.");
                 break;
 
             case Msg.Yield:
-                if (controlling) { controlling = false; lock (forwardedKeys) { forwardedKeys.Clear(); forwardedButtons.Clear(); } CursorHider.Set(false); Fire(); }
+                if (target == from)
+                {
+                    target = null;
+                    lock (forwardedKeys) { forwardedKeys.Clear(); forwardedButtons.Clear(); }
+                    Native.SetCursorPos(pinHome.X, pinHome.Y);
+                    CursorHider.Set(false);
+                    Fire();
+                }
                 break;
 
             case Msg.Release:
-                if (controlled) CursorHider.Set(true); // controller pulled the cursor back home
-                controlled = false;
+                if (controller != from) break;
+                CursorHider.Set(true); // the driving PC took the cursor elsewhere
+                controller = null;
                 ReleaseInjected();
                 Fire();
                 break;
@@ -945,23 +1107,35 @@ sealed partial class Engine : IDisposable
                 int id = r.ReadInt32();
                 var kinds = (ClipKinds)r.ReadByte() & Allowed();
                 string summary = r.ReadString();
-                if (kinds != ClipKinds.None) Clipboard?.ApplyOffer(new ClipOffer(id, kinds, summary));
+                if (kinds != ClipKinds.None) Clipboard?.ApplyOffer(new ClipOffer(from.Id, id, kinds, summary));
                 break;
             }
+        }
+    }
+
+    /// <summary>Is world point (our coordinates x,y) on another PC's screen in the arrangement?</summary>
+    bool SomeoneElseAt(int x, int y)
+    {
+        lock (worldGate)
+        {
+            if (!world.Pos.TryGetValue(MyId, out var me)) return false;
+            var owner = world.Owner(x + me.X, y + me.Y, MonitorsOf);
+            return owner != null && owner != MyId;
         }
     }
 
     ClipKinds Allowed() =>
         (settings.ShareText ? ClipKinds.Text : 0) | (settings.ShareImages ? ClipKinds.Image : 0) | (settings.ShareFiles ? ClipKinds.Files : 0);
 
-    // ======================== clipboard: offers (control link) ========================
+    // ======================== clipboard: offers (control links) ========================
 
-    /// <summary>Tell the peer what we just copied. Only a description goes over the network now; data moves on paste.</summary>
+    /// <summary>Tell every PC what we just copied. Only a description goes over the network now; data moves on paste.</summary>
     public void SendOffer(int id, ClipKinds kinds, string summary)
     {
         kinds &= Allowed();
         if (kinds == ClipKinds.None) return;
-        link?.Send(Wire.Build(Msg.Offer, w => { w.Write(id); w.Write((byte)kinds); w.Write(summary); }));
+        var msg = Wire.Build(Msg.Offer, w => { w.Write(id); w.Write((byte)kinds); w.Write(summary); });
+        foreach (var p in peers.Values) p.Send(msg);
     }
 
     // ======================== clipboard: transfers (separate connections) ========================
@@ -992,7 +1166,7 @@ sealed partial class Engine : IDisposable
     /// <summary>The peer is pasting something we offered: stream it over this dedicated connection.</summary>
     async Task ServeTransfer(Socket s)
     {
-        if (cts == null || link == null) { s.Dispose(); return; }
+        if (cts == null || peers.IsEmpty) { s.Dispose(); return; }
         var l = Link.Handshake(s, settings.Id, master, initiator: false, dataLink: true);
         if (l == null) return;
         Track(l);
@@ -1031,7 +1205,7 @@ sealed partial class Engine : IDisposable
         }
         catch (Exception e) when (e is not OperationCanceledException and not TimeoutException)
         {
-            Notify?.Invoke($"Couldn't send to {PeerName}: {e.Message}");
+            Notify?.Invoke($"Couldn't send to {NameByAddress(l.Address)}: {e.Message}");
             Progress?.Invoke(null, -1);
         }
         catch { }
@@ -1097,8 +1271,7 @@ sealed partial class Engine : IDisposable
     /// </summary>
     public async Task<object?> PullAsync(ClipOffer offer, ClipKinds kind, CancellationToken ct)
     {
-        var main = link;
-        if (main == null || cts == null) return null;
+        if (!peers.TryGetValue(offer.PeerId, out var main) || cts == null) return null;
         Link? l = null;
         try
         {
@@ -1107,12 +1280,12 @@ sealed partial class Engine : IDisposable
             {
                 connectTimeout.CancelAfter(4000);
                 try { await s.ConnectAsync(main.Address, DataPort, connectTimeout.Token).ConfigureAwait(false); }
-                catch { s.Dispose(); Notify?.Invoke($"Couldn't reach {PeerName} to paste. Click \"Allow through firewall\" on that PC."); return null; }
+                catch { s.Dispose(); Notify?.Invoke($"Couldn't reach {main.Name} to paste. Click \"Allow through firewall\" on that PC."); return null; }
             }
             l = await Task.Run(() => Link.Handshake(s, settings.Id, master, initiator: true, dataLink: true), ct).ConfigureAwait(false);
             if (l == null) return null;
             Track(l);
-            var download = new Download(this, offer.Summary);
+            var download = new Download(this, offer.Summary, main.Name);
             l.Message += (_, m) => download.Handle(m);
             l.Closed += _ => download.Fail();
             l.Start();
@@ -1129,6 +1302,8 @@ sealed partial class Engine : IDisposable
 
     record FileEntry(string Path, long Size);
 
+    string NameByAddress(string address) => peers.Values.FirstOrDefault(p => p.Address == address)?.Name ?? "the other PC";
+
     void ReportProgress(string? text, double frac) => Progress?.Invoke(text, frac);
     void ReportNotify(string text) => Notify?.Invoke(text);
 
@@ -1136,7 +1311,7 @@ sealed partial class Engine : IDisposable
     sealed class Download
     {
         readonly Engine e;
-        readonly string label;
+        readonly string label, peerName;
         readonly TaskCompletionSource<object?> done = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public Task<object?> Result => done.Task;
 
@@ -1148,7 +1323,7 @@ sealed partial class Engine : IDisposable
         FileStream? current;
         long remaining;
 
-        public Download(Engine e, string label) { this.e = e; this.label = label; }
+        public Download(Engine e, string label, string peerName) { this.e = e; this.label = label; this.peerName = peerName; }
 
         public void Fail()
         {
@@ -1187,7 +1362,7 @@ sealed partial class Engine : IDisposable
                         folder = stamp;
                         for (int n = 2; Directory.Exists(folder); n++) folder = $"{stamp} ({n})";
                         Directory.CreateDirectory(folder);
-                        if (total > 20_000_000) e.ReportNotify($"Pasting {label} from {e.PeerName}...");
+                        if (total > 20_000_000) e.ReportNotify($"Pasting {label} from {peerName}...");
                         NextFile();
                         break;
 

@@ -82,26 +82,33 @@ public partial class MainWindow : Window
 
     void Refresh()
     {
+        var peers = engine.Peers;
+        string names = peers.Count == 0 ? "" : string.Join(", ", peers.Select(p => p.Name));
+        string connectedTitle = peers.Count == 1 ? $"Connected to {peers[0].Name}" : $"Connected to {peers.Count} PCs";
+        string where = peers.Count == 1 ? peers[0].Address : names;
         (string title, string sub, SolidColorBrush color) = engine.Phase switch
         {
             Phase.Starting => ("Starting...", "Preparing your pairing key", Amber),
-            Phase.Searching => ("Looking for your other PC...", "Open LAN Mouse there too, with the same key", Amber),
-            Phase.Connected when engine.Controlling => ($"Controlling {engine.PeerName}", "Your mouse and keyboard are on the other PC", Blue),
-            Phase.Connected when engine.Controlled => ($"{engine.PeerName} is in control", "Move this PC's own mouse to take it back", Blue),
-            Phase.Connected => ($"Connected to {engine.PeerName}", $"{engine.PeerAddress} | move the cursor across the green line to switch", Green),
-            _ => ("Not connected", "Press Connect on both PCs", Grey),
+            Phase.Searching => ("Looking for your other PCs...", "Open LAN Mouse on them too, with the same key", Amber),
+            Phase.Connected when engine.Controlling => ($"Controlling {engine.ControllingName}", "Your mouse and keyboard are on that PC", Blue),
+            Phase.Connected when engine.Controlled => ($"{engine.ControlledByName} is in control", "Move this PC's own mouse to take it back", Blue),
+            Phase.Connected => (connectedTitle, $"{where} | move the cursor across a green line to switch", Green),
+            _ => ("Not connected", "Press Connect on every PC", Grey),
         };
-        int me = engine.MyNumber, peer = engine.PeerNumber;
-        HotkeyHint.Text = $"Ctrl+Alt+{peer} jumps to the other PC, Ctrl+Alt+{me} comes back here. PC numbers follow your arrangement: 1 is the left (or upper) PC.";
+
+        var view = engine.LayoutView();
+        int me = view.FirstOrDefault(v => v.IsSelf)?.Number ?? 1;
+        var hotkeys = view.Where(v => v.Number <= 9).Select(v => $"Ctrl+Alt+{v.Number} = {(v.IsSelf ? "this PC" : v.Name)}");
+        HotkeyHint.Text = string.Join("\n", hotkeys) + "\nNumbers follow your arrangement: left to right, then top to bottom.";
         if (engine.Phase == Phase.Connected && !engine.Controlling && !engine.Controlled)
             sub = (settings.EdgeSwitch, settings.HotkeySwitch) switch
             {
-                (true, true) => $"{engine.PeerAddress} | cross the green line or press Ctrl+Alt+{peer}",
-                (false, true) => $"{engine.PeerAddress} | press Ctrl+Alt+{peer} to switch",
+                (true, true) => $"{where} | cross a green line or press Ctrl+Alt+number",
+                (false, true) => $"{where} | press Ctrl+Alt+number to switch",
                 (true, false) => sub,
-                _ => $"{engine.PeerAddress} | switching is off (turn it on below)",
+                _ => $"{where} | switching is off (turn it on in Settings)",
             };
-        if (engine.Controlling && settings.HotkeySwitch) sub = $"Ctrl+Alt+{me} or Scroll Lock brings it back";
+        if (engine.Controlling && settings.HotkeySwitch) sub = $"Ctrl+Alt+{me} or Scroll Lock brings it back here";
         StatusTitle.Text = title;
         StatusSub.Text = sub;
         StatusDot.Fill = color;
@@ -117,89 +124,96 @@ public partial class MainWindow : Window
         ConnectBtn.IsEnabled = engine.Phase != Phase.Starting;
         KeyHidden.IsEnabled = KeyShown.IsEnabled = GenBtn.IsEnabled = !running;
         PeerAddress.IsEnabled = !running;
+        ForgetBtn.Visibility = view.Any(v => !v.Online) ? Visibility.Visible : Visibility.Collapsed;
         DrawDisplays();
         App.Current_.UpdateTray(engine);
     }
 
-    // -- arrangement map: both PCs' monitors to scale; drag the other PC's screens to where they really sit --
+    // -- arrangement map: every PC's monitors to scale; drag any PC to where its screens really sit --
     void DisplayMap_SizeChanged(object sender, SizeChangedEventArgs e) => DrawDisplays();
 
     // view transform (kept fixed while dragging so the map doesn't jump around under the mouse)
     double mapScale = 1, mapX, mapY;
-    bool dragging;
+    string? dragId;
     Point dragStart;
-    (int X, int Y) dragFrom, dragOffset;
-
-    (int X, int Y) CurrentOffset => dragging ? dragOffset : engine.PeerOffset;
+    (int X, int Y) dragFrom, dragPos;
+    System.Collections.Generic.List<PcView> pcs = new();
 
     void ComputeView()
     {
         double cw = DisplayMap.ActualWidth, ch = DisplayMap.ActualHeight;
-        var mb = Screens.Box(Screens.Monitors);
-        var pb = Screens.Box(engine.PeerLayoutMonitors);
-        // Room for the other PC on any side of ours.
-        double worldW = mb.Width + 2.0 * pb.Width, worldH = mb.Height + 2.0 * pb.Height;
+        var all = pcs.SelectMany(p => p.Monitors).ToArray();
+        if (all.Length == 0) return;
+        var box = Screens.Box(all);
+        // Leave room to drag a PC to any side of the others.
+        double pad = pcs.Max(p => Math.Max(Screens.Box(p.Monitors).Width, Screens.Box(p.Monitors).Height)) * 0.75;
+        double worldW = box.Width + 2 * pad, worldH = box.Height + 2 * pad;
         mapScale = Math.Min((cw - 8) / worldW, (ch - 8) / worldH);
-        mapX = cw / 2 - (mb.Left + mb.Width / 2.0) * mapScale;
-        mapY = ch / 2 - (mb.Top + mb.Height / 2.0) * mapScale;
+        mapX = cw / 2 - (box.Left + box.Width / 2.0) * mapScale;
+        mapY = ch / 2 - (box.Top + box.Height / 2.0) * mapScale;
     }
 
     Rect ToMap(Screens.Bounds m) => new(mapX + m.Left * mapScale, mapY + m.Top * mapScale, m.Width * mapScale, m.Height * mapScale);
+
+    /// <summary>A PC's monitors where they are drawn right now (moved along while being dragged).</summary>
+    Screens.Bounds[] Drawn(PcView p) =>
+        p.Id == dragId ? Screens.Shift(p.Monitors, dragPos.X - p.Pos.X, dragPos.Y - p.Pos.Y) : p.Monitors;
 
     void DrawDisplays()
     {
         var c = DisplayMap;
         c.Children.Clear();
         if (c.ActualWidth <= 0 || c.ActualHeight <= 0) return;
-        if (!dragging) ComputeView();
+        if (dragId == null) { pcs = engine.LayoutView(); ComputeView(); }
 
-        var mine = Screens.Monitors;
-        var (ox, oy) = CurrentOffset;
-        var theirs = Screens.Shift(engine.PeerLayoutMonitors, ox, oy);
-        bool known = engine.PeerMonitorsKnown;
         bool connected = engine.Phase == Phase.Connected;
-        bool peerActive = connected && engine.Controlling;
-        bool meActive = !peerActive && !(connected && engine.Controlled);
-        string peerName = connected && !string.IsNullOrEmpty(engine.PeerName) ? engine.PeerName : "Other PC";
+        string? active = connected && engine.Controlling ? engine.ControllingId
+                       : connected && engine.Controlled ? null : pcs.FirstOrDefault(p => p.IsSelf)?.Id;
 
-        DrawGroup(c, mine, $"PC {engine.MyNumber}: This PC", meActive, mine: true, known: true);
-        DrawGroup(c, theirs, $"PC {engine.PeerNumber}: {peerName}", peerActive, mine: false, known: known);
-
-        // Where the cursor crosses between the PCs.
-        if (!dragging)
+        // Dragged PC last, so it draws on top.
+        foreach (var p in pcs.OrderBy(p => p.Id == dragId))
         {
-            var glow = Brush("#3DDC97");
-            foreach (var m in mine)
-                foreach (var p in theirs)
-                {
-                    if (Screens.Shared(m, p) <= 0) continue;
-                    var a = ToMap(m); var b = ToMap(p);
-                    System.Windows.Shapes.Line line;
-                    if (m.Right == p.Left || p.Right == m.Left)
-                    {
-                        double x = m.Right == p.Left ? a.Right : a.Left;
-                        line = new() { X1 = x, X2 = x, Y1 = Math.Max(a.Top, b.Top) + 2, Y2 = Math.Min(a.Bottom, b.Bottom) - 2 };
-                    }
-                    else
-                    {
-                        double y = m.Bottom == p.Top ? a.Bottom : a.Top;
-                        line = new() { Y1 = y, Y2 = y, X1 = Math.Max(a.Left, b.Left) + 2, X2 = Math.Min(a.Right, b.Right) - 2 };
-                    }
-                    line.Stroke = glow;
-                    line.StrokeThickness = 3;
-                    line.StrokeStartLineCap = line.StrokeEndLineCap = PenLineCap.Round;
-                    line.IsHitTestVisible = false;
-                    c.Children.Add(line);
-                }
+            string name = p.IsSelf ? $"PC {p.Number}: This PC" : $"PC {p.Number}: {p.Name}";
+            DrawGroup(c, p, Drawn(p), name, p.Id == active);
         }
 
-        int pc = engine.PeerLayoutMonitors.Length;
-        DisplayHint.Text = !known
-            ? "Drag the other PC to where its screen sits. Its real screens appear here once it connects."
-            : $"Drag {peerName}'s {(pc == 1 ? "screen" : $"{pc} screens")} to where they sit next to yours. The green line is where the cursor crosses. Set it on either PC and the other follows.";
+        // Where the cursor crosses between PCs.
+        if (dragId == null)
+        {
+            var glow = Brush("#3DDC97");
+            for (int i = 0; i < pcs.Count; i++)
+                for (int j = i + 1; j < pcs.Count; j++)
+                    foreach (var m in pcs[i].Monitors)
+                        foreach (var p in pcs[j].Monitors)
+                        {
+                            if (Screens.Shared(m, p) <= 0) continue;
+                            var a = ToMap(m); var b = ToMap(p);
+                            System.Windows.Shapes.Line line;
+                            if (m.Right == p.Left || p.Right == m.Left)
+                            {
+                                double x = m.Right == p.Left ? a.Right : a.Left;
+                                line = new() { X1 = x, X2 = x, Y1 = Math.Max(a.Top, b.Top) + 2, Y2 = Math.Min(a.Bottom, b.Bottom) - 2 };
+                            }
+                            else
+                            {
+                                double y = m.Bottom == p.Top ? a.Bottom : a.Top;
+                                line = new() { Y1 = y, Y2 = y, X1 = Math.Max(a.Left, b.Left) + 2, X2 = Math.Min(a.Right, b.Right) - 2 };
+                            }
+                            line.Stroke = glow;
+                            line.StrokeThickness = 3;
+                            line.StrokeStartLineCap = line.StrokeEndLineCap = PenLineCap.Round;
+                            line.IsHitTestVisible = false;
+                            if (!pcs[i].Online || !pcs[j].Online) line.Opacity = 0.35;
+                            c.Children.Add(line);
+                        }
+        }
+
+        DisplayHint.Text = pcs.Count <= 1
+            ? "Your other PCs appear here once they connect. Then drag them to where their screens really sit."
+            : "Drag any PC to where its screens really sit; it snaps to the others. Green lines are where the cursor crosses. Change it on any PC and the rest follow.";
     }
 
-    void DrawGroup(Canvas c, Screens.Bounds[] mons, string name, bool active, bool mine, bool known)
+    void DrawGroup(Canvas c, PcView pc, Screens.Bounds[] mons, string name, bool active)
     {
         var accent = (SolidColorBrush)FindResource("Accent");
         for (int i = 0; i < mons.Length; i++)
@@ -210,13 +224,13 @@ public partial class MainWindow : Window
                 label.Children.Add(new TextBlock
                 {
                     Text = name, FontSize = 10.5, FontWeight = FontWeights.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis,
-                    Foreground = mine ? (Brush)FindResource("Text") : Brush("#C9D3FF"), HorizontalAlignment = HorizontalAlignment.Center,
+                    Foreground = pc.IsSelf ? (Brush)FindResource("Text") : Brush("#C9D3FF"), HorizontalAlignment = HorizontalAlignment.Center,
                     MaxWidth = Math.Max(10, r.Width - 8),
                 });
-            if (mons.Length > 1 || !known)
+            if (mons.Length > 1 || !pc.Known || !pc.Online)
                 label.Children.Add(new TextBlock
                 {
-                    Text = known ? $"Display {i + 1}" : "?", FontSize = 9.5, Foreground = Brush("#8A93A4"),
+                    Text = !pc.Online ? "offline" : pc.Known ? $"Display {i + 1}" : "?", FontSize = 9.5, Foreground = Brush("#8A93A4"),
                     HorizontalAlignment = HorizontalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis,
                     MaxWidth = Math.Max(10, r.Width - 8),
                 });
@@ -224,63 +238,62 @@ public partial class MainWindow : Window
             {
                 Width = Math.Max(4, r.Width - 3), Height = Math.Max(4, r.Height - 3),
                 CornerRadius = new CornerRadius(4), BorderThickness = new Thickness(1.5),
-                BorderBrush = active ? accent : mine ? Brush("#4A5263") : Brush("#5A63A8"),
-                Background = active ? (Brush)FindResource("AccentDim") : mine ? Brush("#1C2029") : Brush("#1D2135"),
-                Opacity = known ? 1 : 0.6,
+                BorderBrush = active ? accent : pc.IsSelf ? Brush("#4A5263") : Brush("#5A63A8"),
+                Background = active ? (Brush)FindResource("AccentDim") : pc.IsSelf ? Brush("#1C2029") : Brush("#1D2135"),
+                Opacity = pc.Online && pc.Known ? 1 : 0.55,
                 Child = label,
-                Cursor = mine ? null : System.Windows.Input.Cursors.SizeAll,
-                ToolTip = mine ? $"This PC, {mons[i].Width} x {mons[i].Height}"
-                        : known ? $"{mons[i].Width} x {mons[i].Height} (drag to move)" : "Drag to move",
-                Tag = mine ? null : "peer",
+                Cursor = System.Windows.Input.Cursors.SizeAll,
+                ToolTip = $"{(pc.IsSelf ? "This PC" : pc.Name)}, {mons[i].Width} x {mons[i].Height} (drag to move)",
             };
-            if (!known) box.BorderBrush = Brush("#4A5160");
             Canvas.SetLeft(box, r.Left + 1.5);
             Canvas.SetTop(box, r.Top + 1.5);
             c.Children.Add(box);
         }
     }
 
-    bool OverPeer(Point p)
-    {
-        var (ox, oy) = engine.PeerOffset;
-        return Screens.Shift(engine.PeerLayoutMonitors, ox, oy).Any(m => ToMap(m).Contains(p));
-    }
+    PcView? PcAt(Point p) => pcs.LastOrDefault(pc => pc.Monitors.Any(m => ToMap(m).Contains(p)));
 
     void DisplayMap_Down(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
         var p = e.GetPosition(DisplayMap);
-        if (!OverPeer(p)) return;
-        dragging = true;
+        if (pcs.Count < 2 || PcAt(p) is not PcView pc) return;
+        dragId = pc.Id;
         dragStart = p;
-        dragFrom = dragOffset = engine.PeerOffset;
+        dragFrom = dragPos = pc.Pos;
         DisplayMap.CaptureMouse();
         e.Handled = true;
     }
 
     void DisplayMap_Move(object sender, System.Windows.Input.MouseEventArgs e)
     {
-        if (!dragging) return;
+        if (dragId == null) return;
         var p = e.GetPosition(DisplayMap);
-        dragOffset = (dragFrom.X + (int)Math.Round((p.X - dragStart.X) / mapScale),
-                      dragFrom.Y + (int)Math.Round((p.Y - dragStart.Y) / mapScale));
+        dragPos = (dragFrom.X + (int)Math.Round((p.X - dragStart.X) / mapScale),
+                   dragFrom.Y + (int)Math.Round((p.Y - dragStart.Y) / mapScale));
         DrawDisplays();
     }
 
     void DisplayMap_Up(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
-        if (!dragging) return;
-        var target = dragOffset;
-        dragging = false;
+        if (dragId == null) return;
+        var (id, to) = (dragId, dragPos);
+        dragId = null;
         DisplayMap.ReleaseMouseCapture();
-        if (target != dragFrom) engine.MovePeer(target.X, target.Y);
+        if (to != dragFrom) engine.MovePc(id, to.X, to.Y);
         Refresh();
     }
 
     void DisplayMap_LostCapture(object sender, System.Windows.Input.MouseEventArgs e)
     {
-        if (!dragging) return;
-        dragging = false;
+        if (dragId == null) return;
+        dragId = null;
         DrawDisplays();
+    }
+
+    void Forget_Click(object sender, RoutedEventArgs e)
+    {
+        if (MessageBox.Show(this, "Remove the offline PCs from the arrangement?", "LAN Mouse", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+            engine.ForgetOffline();
     }
 
     void ShowProgress(string? text, double frac)

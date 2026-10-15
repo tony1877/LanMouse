@@ -255,6 +255,8 @@ static class Screens
 
     static bool Overlap(Bounds a, Bounds b) => a.Left < b.Right && b.Left < a.Right && a.Top < b.Bottom && b.Top < a.Bottom;
 
+    public static bool Overlaps(Bounds[] a, Bounds[] b) => a.Any(m => b.Any(o => Overlap(m, o)));
+
     /// <summary>Length of the border two monitors share (0 if they don't sit edge to edge).</summary>
     public static int Shared(Bounds a, Bounds b)
     {

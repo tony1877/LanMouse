@@ -63,7 +63,7 @@
       </Border>
 
       <!-- Arrangement -->
-      <TextBlock Text="WHERE IS YOUR OTHER PC?" Style="{StaticResource Label}" Margin="2,20,0,8"/>
+      <TextBlock Text="ARRANGE YOUR PCS" Style="{StaticResource Label}" Margin="2,20,0,8"/>
       <Border Style="{StaticResource CardBox}" Padding="12">
         <StackPanel>
           <Canvas x:Name="DisplayMap" Height="230" ClipToBounds="True" Background="Transparent"
@@ -71,6 +71,8 @@
                   MouseLeftButtonDown="DisplayMap_Down" MouseMove="DisplayMap_Move" MouseLeftButtonUp="DisplayMap_Up"
                   LostMouseCapture="DisplayMap_LostCapture"/>
           <TextBlock x:Name="DisplayHint" Foreground="{StaticResource Sub}" FontSize="11.5" TextWrapping="Wrap" TextAlignment="Center" Margin="10,8,10,2"/>
+          <Button x:Name="ForgetBtn" Style="{StaticResource Ghost}" HorizontalAlignment="Center" Margin="0,4,0,-4" Visibility="Collapsed"
+                  Content="Remove offline PCs" Click="Forget_Click"/>
         </StackPanel>
       </Border>
 
@@ -91,7 +93,7 @@
       <TextBlock Text="PAIRING" Style="{StaticResource Label}" Margin="2,14,0,8"/>
       <Border Style="{StaticResource CardBox}">
         <StackPanel>
-          <TextBlock Text="Pairing key (type the same one on both PCs)" Foreground="{StaticResource Sub}" FontSize="12" Margin="0,0,0,7"/>
+          <TextBlock Text="Pairing key (type the same one on every PC)" Foreground="{StaticResource Sub}" FontSize="12" Margin="0,0,0,7"/>
           <Grid>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
@@ -103,7 +105,7 @@
             <Button x:Name="GenBtn" Grid.Column="2" Style="{StaticResource Ghost}" Click="Generate_Click" ToolTip="Make a random key and copy it"
                     FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="14" Content="&#xE8D7;" Width="38" Height="38" Padding="0"/>
           </Grid>
-          <TextBlock Text="Other PC's address (optional, only if it isn't found automatically)" Foreground="{StaticResource Sub}" FontSize="12" Margin="0,14,0,7" TextWrapping="Wrap"/>
+          <TextBlock Text="Other PCs' addresses (optional, only if they aren't found automatically; separate with commas)" Foreground="{StaticResource Sub}" FontSize="12" Margin="0,14,0,7" TextWrapping="Wrap"/>
           <TextBox x:Name="PeerAddress" Style="{StaticResource Field}" ToolTip="e.g. 192.168.1.42 or DESKTOP-NAME"/>
           <TextBlock x:Name="MyAddress" Foreground="#5E6676" FontSize="11.5" Margin="2,7,0,0" TextWrapping="Wrap"/>
         </StackPanel>

@@ -126,8 +126,8 @@ public partial class App : System.Windows.Application
         trayToggle.Text = e.Phase == Phase.Stopped ? "Connect" : "Disconnect";
         var text = e.Phase switch
         {
-            Phase.Connected => $"LAN Mouse: connected to {e.PeerName}",
-            Phase.Searching => "LAN Mouse: looking for other PC",
+            Phase.Connected => $"LAN Mouse: connected to {string.Join(", ", e.Peers.Select(p => p.Name))}",
+            Phase.Searching => "LAN Mouse: looking for your other PCs",
             _ => "LAN Mouse: off",
         };
         tray.Text = text.Length > 63 ? text[..63] : text;

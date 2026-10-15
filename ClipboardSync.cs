@@ -196,8 +196,9 @@ sealed class ClipboardSync : IClipboardSink, IDisposable
         finally { Native.CloseClipboard(); }
     });
 
-    public void ClearOffer() => ui.BeginInvoke(() =>
+    public void ClearOffer(string peerId) => ui.BeginInvoke(() =>
     {
+        if (theirs != null && theirs.PeerId != peerId) return; // the clipboard holds another PC's copy: keep it
         pasteCts?.Cancel();
         if (theirs == null || Native.GetClipboardOwner() != window.Handle) { theirs = null; return; }
         theirs = null;
