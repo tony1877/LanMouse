@@ -26,7 +26,6 @@ public sealed class Settings
     public bool AutoConnect { get; set; } = true;
     public bool EdgeSwitch { get; set; } = true;
     public bool HotkeySwitch { get; set; } = true;
-    public bool ShareWindows { get; set; } = true;
     public bool SignInSupport { get; set; }  // use the privileged agent to reach the sign-in screen (opt-in)
 
     // -- arrangement: where the other PC's desktop sits, in this PC's screen coordinates --

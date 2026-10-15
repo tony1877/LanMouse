@@ -121,7 +121,7 @@ sealed partial class Engine : IDisposable
     {
         this.settings = settings;
         EnsureLayout(announce: false);
-        hook = new InputHook(OnMouse, OnKey, OnMoveSize);
+        hook = new InputHook(OnMouse, OnKey);
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaysChanged;
     }
 
@@ -300,7 +300,6 @@ sealed partial class Engine : IDisposable
             return;
         }
 
-        StartShare();
         Phase = Phase.Searching; Fire();
         _ = Task.Run(() => AcceptLoop(ct));
         _ = Task.Run(() => DataAcceptLoop(ct));
@@ -316,7 +315,6 @@ sealed partial class Engine : IDisposable
         try { dataListener?.Dispose(); } catch { }
         try { udp?.Dispose(); } catch { }
         listener = null; dataListener = null; udp = null;
-        StopShare();
         Phase = Phase.Stopped;
         link?.Dispose();
         link = null;
@@ -536,7 +534,6 @@ sealed partial class Engine : IDisposable
         UpdatePlaced();
         ResetInputState();
         AbortTransfers();
-        EndAllStreams();
         Clipboard?.ClearOffer();
         if (Phase == Phase.Connected) Phase = Phase.Searching;
         Fire();
@@ -571,10 +568,12 @@ sealed partial class Engine : IDisposable
 
     // ======================== local input (hook thread, keep fast) ========================
 
+    bool lockSwallowedL;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool LockWorkStation();
+
     bool OnMouse(int msg, in Native.MSLLHOOKSTRUCT m)
     {
-        if (msg == Native.WM_MOUSEMOVE) SampleDrag(m.pt.X, m.pt.Y);
-        if (manualDrag != 0) ManualDragStep(msg, m.pt.X, m.pt.Y);
         if (m.extra == Inject.Magic) return false;
         var l = link;
 
@@ -584,9 +583,8 @@ sealed partial class Engine : IDisposable
             switch (msg)
             {
                 case Native.WM_MOUSEMOVE:
-                    // Movement is the offset from where the hidden cursor was last left (centre, or wherever window-
-                    // sharing injection moved it). Then snap it back to the centre so it never drifts into a screen
-                    // edge (where Windows would clamp it and swallow further movement) and the next delta stays clean.
+                    // Movement is the offset from the hidden cursor's parking spot. Then snap it back there so it never
+                    // drifts into a screen edge (where Windows would clamp it and swallow further movement).
                     short dx = (short)Math.Clamp(m.pt.X - pin.X, -32000, 32000), dy = (short)Math.Clamp(m.pt.Y - pin.Y, -32000, 32000);
                     if (dx != 0 || dy != 0)
                     {
@@ -630,17 +628,8 @@ sealed partial class Engine : IDisposable
         if (l != null && settings.ShareInput && settings.EdgeSwitch && PeerMonitors.Length > 0 && Environment.TickCount64 > cooldownUntil
             && Screens.Crossing(Screens.Monitors, peerPlaced, m.pt.X, m.pt.Y) is (int X, int Y) p)
         {
-            var dragged = DraggedWindow();
-            if (dragged == 0 && AnyMouseButtonDown()) return false;
+            if (AnyMouseButtonDown()) return false;
             GoToPeer(l, (p.X - settings.PeerOffsetX, p.Y - settings.PeerOffsetY));
-            if (dragged != 0)
-            {
-                // Dragging a window across: it goes along. Keep the held button so letting go drops it over there.
-                movingHwnd = 0;
-                lock (forwardedKeys) forwardedButtons.Add(0);
-                manualDrag = 0;
-                if (HandDraggedToPeer(l, dragged, m.pt.X, m.pt.Y)) OnInjector(InjectEscape); // never inject from the hook thread
-            }
             return true;
         }
         return false;
@@ -859,16 +848,9 @@ sealed partial class Engine : IDisposable
                     // our dead-reckoned position would march off the edge and bounce back for no reason.
                     if ((secureActive || !inputBlocked) && peerAllowsEdgeReturn && Screens.At(peerPlaced, nx, ny) != null)
                     {
-                        var dragged = DraggedWindow();
                         controlled = false;
                         int bx = nx - settings.PeerOffsetX, by = ny - settings.PeerOffsetY, applied = movesApplied;
                         l.Send(Wire.Build(Msg.Return, w => { w.Write(bx); w.Write(by); w.Write(applied); }));
-                        if (dragged != 0)
-                        {
-                            movingHwnd = 0;
-                            manualDrag = 0;
-                            if (HandDraggedToPeer(l, dragged, rx, ry)) InjectEscape();
-                        }
                         ReleaseInjected();
                         CursorHider.Set(true); // cursor left this PC
                         ThreadPool.QueueUserWorkItem(_ => Fire());
@@ -897,7 +879,31 @@ sealed partial class Engine : IDisposable
             case Msg.Key:
                 if (!controlled || SecureDesktopBlocks(l)) break;
                 ushort vk = r.ReadUInt16(), scan = r.ReadUInt16(); bool ext = r.ReadBoolean(), kd = r.ReadBoolean();
-                lock (injectedKeys) { if (kd) injectedKeys.Add((vk, scan, ext)); else injectedKeys.Remove((vk, scan, ext)); }
+                bool injWin;
+                lock (injectedKeys)
+                {
+                    if (kd) injectedKeys.Add((vk, scan, ext)); else injectedKeys.Remove((vk, scan, ext));
+                    injWin = injectedKeys.Any(k => k.vk is 0x5B or 0x5C);
+                }
+                // Windows ignores a synthesized Win+L (only real keyboards may lock), so the L just got typed.
+                // Do the lock ourselves and keep the L out.
+                if (vk == 0x4C && (kd ? injWin : lockSwallowedL))
+                {
+                    lockSwallowedL = kd;
+                    lock (injectedKeys) injectedKeys.Remove((vk, scan, ext));
+                    if (kd)
+                    {
+                        // Let go of Win first, or it stays held through the lock screen.
+                        lock (injectedKeys)
+                            foreach (var k in injectedKeys.Where(k => k.vk is 0x5B or 0x5C).ToList())
+                            {
+                                InjKey(k.vk, k.scan, k.ext, false);
+                                injectedKeys.Remove(k);
+                            }
+                        LockWorkStation();
+                    }
+                    break;
+                }
                 InjKey(vk, scan, ext, kd);
                 break;
 
@@ -932,8 +938,7 @@ sealed partial class Engine : IDisposable
                 break;
 
             default:
-                OnShareMessage(l, type, r);
-                break;
+                break; // unknown (e.g. window-sharing messages from an older version): ignore
 
             case Msg.Offer:
             {

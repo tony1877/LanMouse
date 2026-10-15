@@ -25,7 +25,7 @@ public partial class App : System.Windows.Application
     {
         base.OnStartup(e);
         CursorHider.RestoreNow(); // in case a previous run died while the pointer was hidden
-        AppDomain.CurrentDomain.ProcessExit += (_, _) => { CursorHider.RestoreNow(); Engine.EmergencyRestoreWindows(); };
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => { CursorHider.RestoreNow(); };
         DispatcherUnhandledException += (_, a) => { Crash(a.Exception); a.Handled = true; };
         AppDomain.CurrentDomain.UnhandledException += (_, a) => Crash(a.ExceptionObject as Exception);
         System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, a) => a.SetObserved();
@@ -93,7 +93,6 @@ public partial class App : System.Windows.Application
     static void Crash(Exception? ex)
     {
         try { CursorHider.RestoreNow(); } catch { }
-        try { Engine.EmergencyRestoreWindows(); } catch { }
         try
         {
             System.IO.Directory.CreateDirectory(Settings.Dir);

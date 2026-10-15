@@ -127,7 +127,6 @@
           <CheckBox x:Name="OptText" Style="{StaticResource Switch}" Content="Copied text"/>
           <CheckBox x:Name="OptImages" Style="{StaticResource Switch}" Content="Pictures &amp; screenshots"/>
           <CheckBox x:Name="OptFiles" Style="{StaticResource Switch}" Content="Files &amp; folders"/>
-          <CheckBox x:Name="OptWindows" Style="{StaticResource Switch}" Content="Drag windows to the other PC"/>
           <Rectangle Height="1" Fill="{StaticResource Line}" Margin="0,8"/>
           <CheckBox x:Name="OptStartup" Style="{StaticResource Switch}" Content="Start with Windows (in the tray)"/>
           <CheckBox x:Name="OptAuto" Style="{StaticResource Switch}" Content="Connect automatically on launch"/>

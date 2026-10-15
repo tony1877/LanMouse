@@ -31,13 +31,12 @@ public partial class MainWindow : Window
         OptText.IsChecked = settings.ShareText;
         OptImages.IsChecked = settings.ShareImages;
         OptFiles.IsChecked = settings.ShareFiles;
-        OptWindows.IsChecked = settings.ShareWindows;
         OptAuto.IsChecked = settings.AutoConnect;
         OptEdge.IsChecked = settings.EdgeSwitch;
         OptHotkey.IsChecked = settings.HotkeySwitch;
         OptStartup.IsChecked = Settings.StartWithWindows;
 
-        foreach (var cb in new[] { OptInput, OptText, OptImages, OptFiles, OptWindows, OptAuto, OptStartup, OptEdge, OptHotkey })
+        foreach (var cb in new[] { OptInput, OptText, OptImages, OptFiles, OptAuto, OptStartup, OptEdge, OptHotkey })
         {
             cb.Checked += (_, _) => SaveOptions();
             cb.Unchecked += (_, _) => SaveOptions();
@@ -70,7 +69,6 @@ public partial class MainWindow : Window
         settings.ShareText = OptText.IsChecked == true;
         settings.ShareImages = OptImages.IsChecked == true;
         settings.ShareFiles = OptFiles.IsChecked == true;
-        settings.ShareWindows = OptWindows.IsChecked == true;
         settings.AutoConnect = OptAuto.IsChecked == true;
         settings.EdgeSwitch = OptEdge.IsChecked == true;
         settings.HotkeySwitch = OptHotkey.IsChecked == true;

@@ -349,30 +349,50 @@ static class Inject
         Native.SendInput(1, new[] { i }, Size);
     }
 
-    public static void MoveTo(int x, int y)
+    static (int, int) Abs(int x, int y)
     {
         var v = Screens.Virtual;
-        int ax = (int)(((long)(x - v.Left) * 65535 + (v.Width - 1) / 2) / Math.Max(1, v.Width - 1));
-        int ay = (int)(((long)(y - v.Top) * 65535 + (v.Height - 1) / 2) / Math.Max(1, v.Height - 1));
+        return ((int)(((long)(x - v.Left) * 65535 + (v.Width - 1) / 2) / Math.Max(1, v.Width - 1)),
+                (int)(((long)(y - v.Top) * 65535 + (v.Height - 1) / 2) / Math.Max(1, v.Height - 1)));
+    }
+
+    public static void MoveTo(int x, int y)
+    {
+        var (ax, ay) = Abs(x, y);
         Mouse(ax, ay, 0, MOVE | ABSOLUTE | VIRTUALDESK);
     }
 
     /// <param name="button">0 left, 1 right, 2 middle, 3 X1, 4 X2</param>
-    public static void Button(int button, bool down)
+    /// <param name="at">If set, move there in the same input event, so nothing can move the cursor in between.</param>
+    public static void Button(int button, bool down, (int X, int Y)? at = null)
     {
+        uint flags, data = 0;
         switch (button)
         {
-            case 0: Mouse(0, 0, 0, down ? LDOWN : LUP); break;
-            case 1: Mouse(0, 0, 0, down ? RDOWN : RUP); break;
-            case 2: Mouse(0, 0, 0, down ? MDOWN : MUP); break;
-            case 3: case 4: Mouse(0, 0, (uint)(button - 2), down ? XDOWN : XUP); break;
+            case 0: flags = down ? LDOWN : LUP; break;
+            case 1: flags = down ? RDOWN : RUP; break;
+            case 2: flags = down ? MDOWN : MUP; break;
+            case 3: case 4: flags = down ? XDOWN : XUP; data = (uint)(button - 2); break;
+            default: return;
         }
+        Send(data, flags, at);
     }
 
-    public static void Wheel(int delta, bool horizontal) => Mouse(0, 0, unchecked((uint)delta), horizontal ? HWHEEL : WHEEL);
+    public static void Wheel(int delta, bool horizontal, (int X, int Y)? at = null) =>
+        Send(unchecked((uint)delta), horizontal ? HWHEEL : WHEEL, at);
+
+    static void Send(uint data, uint flags, (int X, int Y)? at)
+    {
+        if (at is not { } p) { Mouse(0, 0, data, flags); return; }
+        var (ax, ay) = Abs(p.X, p.Y);
+        Mouse(ax, ay, data, flags | MOVE | ABSOLUTE | VIRTUALDESK);
+    }
 
     public static void Key(ushort vk, ushort scan, bool extended, bool down)
     {
+        // Right Shift arrives from the hook flagged as extended (it isn't), and NumLock/Pause/PrintScreen have odd
+        // scan codes: sent by scan code they come out as the wrong key or nothing. Send those by virtual key.
+        if (vk is 0xA1 or 0x90 or 0x13 or 0x2C) { scan = 0; extended = vk is 0x90 or 0x2C; }
         uint flags = (down ? 0 : KEYUP) | (extended ? EXTENDED : 0);
         if (scan != 0) flags |= SCANCODE;
         var i = new Native.INPUT { type = 1 };
