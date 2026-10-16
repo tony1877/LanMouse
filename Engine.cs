@@ -117,8 +117,9 @@ sealed partial class Engine : IDisposable
         nextDesktopCheck = now + 200;
         bool deskUnreachable = !Native.InputDesktopReachable();
         bool elevated = !deskUnreachable && Native.ForegroundInputBlocked();
+        onSecureDesktop = deskUnreachable;
         if (!deskUnreachable && !elevated) { secureActive = false; inputBlocked = false; return false; }
-        if (settings.SignInSupport && secure.TryConnect()) { secureActive = true; inputBlocked = false; return false; }
+        if (settings.SignInSupport && !agentBroken && secure.TryConnect()) { secureActive = true; inputBlocked = false; return false; }
         secureActive = false;
         inputBlocked = true;
         if (deskUnreachable)
@@ -646,7 +647,37 @@ sealed partial class Engine : IDisposable
         if (peers.IsEmpty) AbortTransfers();
     }
 
-    void InjMove(int x, int y) { if (secureActive) secure.Move(x, y); else Inject.MoveTo(x, y); }
+    void InjMove(int x, int y)
+    {
+        if (!secureActive) { Inject.MoveTo(x, y); return; }
+        VerifyAgent();
+        secure.Move(x, y);
+        if (!onSecureDesktop) agentExpect = (x, y);
+    }
+
+    // -- safety net for sign-in support --
+    // If the agent accepts our input but nothing happens (stale install, wrong token, broken worker), this PC would
+    // be impossible to control. While the normal desktop is up we can see whether the cursor really moved; if it
+    // keeps not moving, stop using the agent for this session and go back to normal input.
+    volatile bool onSecureDesktop;
+    bool agentBroken;
+    int agentMisses;
+    (int X, int Y)? agentExpect;
+
+    void VerifyAgent()
+    {
+        if (agentExpect is not (int X, int Y) want || onSecureDesktop) return;
+        agentExpect = null;
+        Native.GetCursorPos(out var cur);
+        if (Math.Abs(cur.X - want.X) <= 2 && Math.Abs(cur.Y - want.Y) <= 2) { agentMisses = 0; return; }
+        if (++agentMisses < 15) return;
+        agentBroken = true;
+        secureActive = false;
+        Agent.Log("client: agent is not delivering input; falling back to normal input for this session");
+        Warning = "Sign-in support on this PC isn't working, so it was switched off until LAN Mouse restarts. Remove and reinstall it in Settings.";
+        Notify?.Invoke(Warning);
+        ThreadPool.QueueUserWorkItem(_ => Fire());
+    }
     void InjButton(int b, bool down) { if (secureActive) secure.Button(b, down); else Inject.Button(b, down); }
     void InjWheel(short delta, bool horizontal) { if (secureActive) secure.Wheel(delta, horizontal); else Inject.Wheel(delta, horizontal); }
     void InjKey(ushort vk, ushort scan, bool ext, bool down) { if (secureActive) secure.Key(vk, scan, ext, down); else Inject.Key(vk, scan, ext, down); }

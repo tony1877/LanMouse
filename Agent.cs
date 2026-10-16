@@ -66,6 +66,11 @@ static class Agent
             Directory.CreateDirectory(DataDir);
             // Shared secret so only a process that can read this file (processes in this user's session) may drive
             // the worker. ProgramData is readable by the service (SYSTEM) and this user by default.
+            // Installing again (or over an older version) must replace the running service: otherwise its worker
+            // keeps the old token and binary, and silently rejects every connection. Stopping it also ends its worker.
+            Sc($"stop {ServiceName}");
+            Sc($"delete {ServiceName}");
+            for (int i = 0; i < 20 && IsInstalled(); i++) Thread.Sleep(250);
             File.WriteAllText(TokenFile, Convert.ToHexString(RandomNumberGenerator.GetBytes(32)));
 
             Sc($"create {ServiceName} binPath= \"\\\"{Environment.ProcessPath}\\\" --agent-service\" start= auto DisplayName= \"LAN Mouse sign-in support\"");
@@ -231,9 +236,6 @@ static class Agent
 
     public static void RunWorker()
     {
-        string token;
-        try { token = File.ReadAllText(TokenFile).Trim(); }
-        catch (Exception e) { Log("worker: cannot read token: " + e.Message); return; }
         Log("worker started");
 
         while (true)
@@ -243,6 +245,10 @@ static class Agent
                 using var pipe = CreatePipe();
                 pipe.WaitForConnection();
                 Log("worker: client connected");
+                // Read the token per connection, so a reinstall (new token) never leaves us rejecting everyone.
+                string token;
+                try { token = File.ReadAllText(TokenFile).Trim(); }
+                catch (Exception e) { Log("worker: cannot read token: " + e.Message); continue; }
                 Serve(pipe, token);
                 Log("worker: client gone");
             }
