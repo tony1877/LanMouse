@@ -339,6 +339,11 @@ static class Screens
 static class Inject
 {
     public const nint Magic = 0x4C4D4F55;
+
+    /// <summary>Result of the last SendInput on this thread: events accepted (0 = blocked) and the Win32 error.</summary>
+    [ThreadStatic] public static uint LastSent;
+    [ThreadStatic] public static int LastError;
+    static void Record(uint sent) { LastSent = sent; LastError = sent == 0 ? Marshal.GetLastWin32Error() : 0; }
     const uint MOVE = 0x1, LDOWN = 0x2, LUP = 0x4, RDOWN = 0x8, RUP = 0x10, MDOWN = 0x20, MUP = 0x40,
         XDOWN = 0x80, XUP = 0x100, WHEEL = 0x800, HWHEEL = 0x1000, VIRTUALDESK = 0x4000, ABSOLUTE = 0x8000;
     const uint KEYUP = 0x2, EXTENDED = 0x1, SCANCODE = 0x8;
@@ -348,7 +353,7 @@ static class Inject
     {
         var i = new Native.INPUT { type = 0 };
         i.u.mi = new Native.MOUSEINPUT { dx = dx, dy = dy, mouseData = data, dwFlags = flags, dwExtraInfo = Magic };
-        Native.SendInput(1, new[] { i }, Size);
+        Record(Native.SendInput(1, new[] { i }, Size));
     }
 
     static (int, int) Abs(int x, int y)
@@ -399,6 +404,6 @@ static class Inject
         if (scan != 0) flags |= SCANCODE;
         var i = new Native.INPUT { type = 1 };
         i.u.ki = new Native.KEYBDINPUT { wVk = scan != 0 ? (ushort)0 : vk, wScan = scan, dwFlags = flags, dwExtraInfo = Magic };
-        Native.SendInput(1, new[] { i }, Size);
+        Record(Native.SendInput(1, new[] { i }, Size));
     }
 }

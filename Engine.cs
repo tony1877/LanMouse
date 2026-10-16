@@ -119,7 +119,13 @@ sealed partial class Engine : IDisposable
         bool elevated = !deskUnreachable && Native.ForegroundInputBlocked();
         onSecureDesktop = deskUnreachable;
         if (!deskUnreachable && !elevated) { secureActive = false; inputBlocked = false; return false; }
-        if (settings.SignInSupport && !agentBroken && secure.TryConnect()) { secureActive = true; inputBlocked = false; return false; }
+        if (settings.SignInSupport && !agentBroken && secure.TryConnect())
+        {
+            if (!secureActive) SecureInput.ClientLog($"routing input through the agent ({(deskUnreachable ? "sign-in screen" : "elevated app")})");
+            secureActive = true; inputBlocked = false; return false;
+        }
+        var why = $"cannot route through the agent: support={settings.SignInSupport} broken={agentBroken}; {(deskUnreachable ? "sign-in screen unreachable, handing control back" : "elevated app blocks input")}";
+        if (why != lastRouteNote) SecureInput.ClientLog(lastRouteNote = why);
         secureActive = false;
         inputBlocked = true;
         if (deskUnreachable)
@@ -660,6 +666,7 @@ sealed partial class Engine : IDisposable
     // be impossible to control. While the normal desktop is up we can see whether the cursor really moved; if it
     // keeps not moving, stop using the agent for this session and go back to normal input.
     volatile bool onSecureDesktop;
+    string? lastRouteNote;
     bool agentBroken;
     int agentMisses;
     (int X, int Y)? agentExpect;
@@ -673,7 +680,7 @@ sealed partial class Engine : IDisposable
         if (++agentMisses < 15) return;
         agentBroken = true;
         secureActive = false;
-        Agent.Log("client: agent is not delivering input; falling back to normal input for this session");
+        SecureInput.ClientLog("agent is not delivering input; falling back to normal input for this session");
         Warning = "Sign-in support on this PC isn't working, so it was switched off until LAN Mouse restarts. Remove and reinstall it in Settings.";
         Notify?.Invoke(Warning);
         ThreadPool.QueueUserWorkItem(_ => Fire());

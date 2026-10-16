@@ -55,7 +55,7 @@ sealed class SecureInput : IDisposable
     public void Wheel(short delta, bool horizontal) => Send(w => { w.Write(Agent.CmdWheel); w.Write(delta); w.Write(horizontal); });
     public void Key(ushort vk, ushort scan, bool ext, bool down) => Send(w => { w.Write(Agent.CmdKey); w.Write(vk); w.Write(scan); w.Write(ext); w.Write(down); });
 
-    static void ClientLog(string m)
+    internal static void ClientLog(string m)
     {
         try { File.AppendAllText(Path.Combine(Settings.Dir, "secure-client.log"), $"{DateTime.Now:HH:mm:ss.fff} {m}{Environment.NewLine}"); }
         catch { }

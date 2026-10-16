@@ -288,7 +288,20 @@ static class Agent
             // Fresh thread: no windows or input yet, so attaching to the desktop succeeds here where it wouldn't later.
             if (!SetThreadDesktop(desktop)) { Log($"worker: SetThreadDesktop({name}) failed {Marshal.GetLastWin32Error()}"); return; }
             Log("worker: attached to desktop " + name);
-            foreach (var a in queue.GetConsumingEnumerable()) { try { a(); } catch { } }
+            int ok = 0, failed = 0;
+            long nextReport = 0;
+            foreach (var a in queue.GetConsumingEnumerable())
+            {
+                try { a(); } catch (Exception e) { Log($"worker: inject error on {name}: {e.Message}"); }
+                if (Inject.LastSent == 0) failed++; else ok++;
+                // Say whether Windows actually accepted what we injected (at most every 2 s, only when there was input).
+                if (Environment.TickCount64 >= nextReport)
+                {
+                    Log($"worker: on {name}: {ok} events accepted, {failed} blocked" + (failed > 0 ? $" (last error {Inject.LastError})" : ""));
+                    ok = failed = 0;
+                    nextReport = Environment.TickCount64 + 2000;
+                }
+            }
         }
     }
 
