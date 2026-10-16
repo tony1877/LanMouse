@@ -16,7 +16,7 @@
     <AssemblyName>LanMouse</AssemblyName>
     <StartupObject>LanMouse.Program</StartupObject>
     <Product>LAN Mouse</Product>
-    <Version>1.2.0</Version>
+    <Version>1.2.1</Version>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
