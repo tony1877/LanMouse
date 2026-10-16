@@ -984,7 +984,13 @@ sealed partial class Engine : IDisposable
 
             case Msg.Enter:
             {
-                if (!settings.ShareInput || !from.Modern) break;
+                if (!from.Modern) break;
+                if (!settings.ShareInput)
+                {
+                    // Say so, instead of silently swallowing the cursor: the other PC brings it back and explains.
+                    from.Send(Wire.Build(Msg.InputOff));
+                    break;
+                }
                 // Someone else takes over: stop driving whatever we were driving, and tell a previous driver it lost us.
                 if (target != null) ComeHome(null);
                 var prev = controller;
@@ -1097,6 +1103,19 @@ sealed partial class Engine : IDisposable
                 OnReturn(from, hx, hy, applied);
                 break;
             }
+
+            case Msg.InputOff:
+                if (target == from)
+                {
+                    target = null;
+                    cooldownUntil = Environment.TickCount64 + 1500; // don't bounce straight back
+                    lock (forwardedKeys) { forwardedKeys.Clear(); forwardedButtons.Clear(); }
+                    Native.SetCursorPos(pinHome.X, pinHome.Y);
+                    CursorHider.Set(false);
+                    Fire();
+                }
+                Notify?.Invoke($"{from.Name} has \"Mouse & keyboard\" turned off in its LAN Mouse settings, so it can't be controlled. Turn it on there.");
+                break;
 
             case Msg.Locked:
                 if (target == from)

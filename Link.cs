@@ -211,7 +211,7 @@ enum Msg : byte
 {
     Hello = 1, Enter, Move, Button, Wheel, Key, Return, Release, Yield, Text, Ping, Screens, Layout, Offer, Pull, Gone,
     FilesStart = 20, ImageStart, Chunk, End,
-    Locked = 40,
+    Locked = 40, InputOff,
     // 30-38 were window sharing (removed); old peers may still send them and they are ignored.
 }
 

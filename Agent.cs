@@ -106,7 +106,7 @@ static class Agent
 
     // ------------------------ the service (LocalSystem, session 0) ------------------------
 
-    static int statusHandle;
+    static nint statusHandle;
     static ServiceCtrlHandler? ctrlHandlerRef;
     static ServiceMainProc? mainProcRef;
     static volatile bool serviceRunning;
@@ -354,9 +354,9 @@ static class Agent
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern bool StartServiceCtrlDispatcher(SERVICE_TABLE_ENTRY[] table);
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    static extern int RegisterServiceCtrlHandlerEx(string name, ServiceCtrlHandler handler, nint ctx);
+    static extern nint RegisterServiceCtrlHandlerEx(string name, ServiceCtrlHandler handler, nint ctx);
     [DllImport("advapi32.dll", SetLastError = true)]
-    static extern bool SetServiceStatus(int handle, ref SERVICE_STATUS status);
+    static extern bool SetServiceStatus(nint handle, ref SERVICE_STATUS status);
     [DllImport("advapi32.dll", SetLastError = true)]
     static extern bool OpenProcessToken(nint process, int access, out nint token);
     [DllImport("advapi32.dll", SetLastError = true)]
