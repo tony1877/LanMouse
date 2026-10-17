@@ -48,6 +48,11 @@ public sealed class Settings
     public Dictionary<string, int[]> WorldPositions { get; set; } = new();
     /// <summary>When the arrangement was last changed (UTC ticks); the newest wins across all PCs.</summary>
     public long WorldStamp { get; set; }
+    /// <summary>
+    /// The arrangement as it was just before a stand-in screen (ScreenLink's virtual display) appeared on this PC;
+    /// put back when it goes away. Null when no stand-in is shown.
+    /// </summary>
+    public Dictionary<string, int[]>? WorldBeforeStandIn { get; set; }
     /// <summary>Every PC seen so far, so they can be drawn (and numbered) while offline.</summary>
     public Dictionary<string, KnownPc> KnownPcs { get; set; } = new();
 

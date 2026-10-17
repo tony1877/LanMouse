@@ -164,14 +164,15 @@ static class Screens
     /// <summary>Every monitor's rectangle (cached; call <see cref="Refresh"/> when the display setup changes).</summary>
     public static Bounds[] Monitors => monitors ??= Load(includeStandIns: true);
 
+    /// <summary>Monitors without stand-in screens (see <see cref="HasStandIn"/>).</summary>
+    static Bounds[] Reported => reported ??= Load(includeStandIns: false);
+
     /// <summary>
-    /// The monitors other PCs and the shared arrangement get to see: all of them except stand-in screens that only
-    /// borrow another PC's spot. ScreenLink's virtual display (monitor MTT1337) shows this PC on a monitor that
-    /// normally shows another PC, so it sits exactly where that PC is arranged; reporting it would make every PC
-    /// shove the arrangement around each time it's switched on or off. Locally it still counts as one of our
-    /// screens, so the cursor moves onto it instead of jumping to the PC it covers.
+    /// A stand-in screen is attached: ScreenLink's virtual display (monitor MTT1337), which shows this PC on a monitor
+    /// that normally shows another PC, so it sits exactly where that PC is arranged. It is reported like any screen
+    /// (other PCs must route the cursor to us there), and the arrangement is restored when it goes away.
     /// </summary>
-    public static Bounds[] Reported => reported ??= Load(includeStandIns: false);
+    public static bool HasStandIn => Reported.Length != Monitors.Length;
 
     public static void Refresh() { monitors = null; reported = null; lock (scales) scales.Clear(); }
 
@@ -217,14 +218,38 @@ static class Screens
         }
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct MONITORINFOEX
+    {
+        public int cbSize;
+        public int left, top, right, bottom, workLeft, workTop, workRight, workBottom;
+        public int dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szDevice;
+    }
+    delegate bool MonitorEnumProc(nint monitor, nint hdc, nint rect, nint data);
+    [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(nint hdc, nint clip, MonitorEnumProc proc, nint data);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(nint monitor, ref MONITORINFOEX info);
+
+    /// <summary>
+    /// Read the monitors straight from Windows. (WinForms' Screen.AllScreens caches them and refreshes the cache
+    /// from the same DisplaySettingsChanged event we react to, so it can still hand back the old setup.)
+    /// </summary>
     static Bounds[] Load(bool includeStandIns)
     {
         try
         {
-            var all = System.Windows.Forms.Screen.AllScreens
-                .Where(s => includeStandIns || !IsStandIn(s.DeviceName))
-                .OrderBy(s => s.Bounds.Left).ThenBy(s => s.Bounds.Top)
-                .Select(s => new Bounds(s.Bounds.Left, s.Bounds.Top, Math.Max(1, s.Bounds.Width), Math.Max(1, s.Bounds.Height)))
+            var found = new System.Collections.Generic.List<(Bounds b, string dev)>();
+            EnumDisplayMonitors(0, 0, (h, _, _, _) =>
+            {
+                var mi = new MONITORINFOEX { cbSize = Marshal.SizeOf<MONITORINFOEX>() };
+                if (GetMonitorInfo(h, ref mi))
+                    found.Add((new Bounds(mi.left, mi.top, Math.Max(1, mi.right - mi.left), Math.Max(1, mi.bottom - mi.top)), mi.szDevice));
+                return true;
+            }, 0);
+            var all = found
+                .Where(s => includeStandIns || !IsStandIn(s.dev))
+                .OrderBy(s => s.b.Left).ThenBy(s => s.b.Top)
+                .Select(s => s.b)
                 .ToArray();
             if (all.Length > 0) return all;
         }

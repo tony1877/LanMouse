@@ -164,7 +164,36 @@ sealed partial class Engine : IDisposable
             world = new World { Stamp = settings.WorldStamp };
             foreach (var (id, p) in settings.WorldPositions)
                 if (p is { Length: 2 }) world.Pos[id] = (p[0], p[1]);
+            // The stand-in screen went away while we weren't running: put the arrangement back now.
+            if (!Screens.HasStandIn) RestoreBeforeStandIn();
         }
+    }
+
+    /// <summary>
+    /// A stand-in screen (ScreenLink's virtual display) covers another PC's spot, so while it's attached the usual
+    /// overlap rules move PCs aside. Remember the arrangement when it appears and put it back when it goes away,
+    /// with a fresh stamp so every PC adopts it. Call under <see cref="worldGate"/>. Returns true if restored.
+    /// </summary>
+    bool TrackStandIn(bool standIn)
+    {
+        if (standIn && settings.WorldBeforeStandIn == null)
+        {
+            settings.WorldBeforeStandIn = world.Pos.ToDictionary(kv => kv.Key, kv => new[] { kv.Value.X, kv.Value.Y });
+            settings.Save();
+            return false;
+        }
+        return !standIn && RestoreBeforeStandIn();
+    }
+
+    bool RestoreBeforeStandIn()
+    {
+        if (settings.WorldBeforeStandIn is not { } before) return false;
+        foreach (var (id, p) in before)
+            if (p is { Length: 2 } && world.Pos.ContainsKey(id)) world.Pos[id] = (p[0], p[1]);
+        settings.WorldBeforeStandIn = null;
+        world.Stamp = DateTime.UtcNow.Ticks;
+        SaveWorld();
+        return true;
     }
 
     void SaveWorld()
@@ -177,7 +206,7 @@ sealed partial class Engine : IDisposable
     /// <summary>Monitors of any PC in its own coordinates: live if connected, else as last seen, else a stand-in.</summary>
     Screens.Bounds[] MonitorsOf(string id)
     {
-        if (id == MyId) return Screens.Reported;
+        if (id == MyId) return Screens.Monitors;
         if (peers.TryGetValue(id, out var p) && p.Monitors.Length > 0) return p.Monitors;
         if (settings.KnownPcs.TryGetValue(id, out var k))
         {
@@ -323,9 +352,12 @@ sealed partial class Engine : IDisposable
     void OnDisplaysChanged(object? sender, EventArgs e)
     {
         Screens.Refresh();
+        bool restored;
+        lock (worldGate) restored = TrackStandIn(Screens.HasStandIn);
         var msg = Wire.Build(Msg.Screens, WriteMonitors);
         foreach (var p in peers.Values) p.Send(msg);
         FixLayout(announce: true);
+        if (restored) BroadcastLayout(); // newer stamp: the others adopt the restored arrangement
         Fire();
     }
 
@@ -340,7 +372,7 @@ sealed partial class Engine : IDisposable
 
     static void WriteMonitors(BinaryWriter w)
     {
-        var mons = Screens.Reported;
+        var mons = Screens.Monitors;
         w.Write((byte)Math.Min(mons.Length, 16));
         foreach (var m in mons.Take(16)) { w.Write(m.Left); w.Write(m.Top); w.Write(m.Width); w.Write(m.Height); }
     }
