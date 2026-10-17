@@ -177,7 +177,7 @@ sealed partial class Engine : IDisposable
     /// <summary>Monitors of any PC in its own coordinates: live if connected, else as last seen, else a stand-in.</summary>
     Screens.Bounds[] MonitorsOf(string id)
     {
-        if (id == MyId) return Screens.Monitors;
+        if (id == MyId) return Screens.Reported;
         if (peers.TryGetValue(id, out var p) && p.Monitors.Length > 0) return p.Monitors;
         if (settings.KnownPcs.TryGetValue(id, out var k))
         {
@@ -340,7 +340,7 @@ sealed partial class Engine : IDisposable
 
     static void WriteMonitors(BinaryWriter w)
     {
-        var mons = Screens.Monitors;
+        var mons = Screens.Reported;
         w.Write((byte)Math.Min(mons.Length, 16));
         foreach (var m in mons.Take(16)) { w.Write(m.Left); w.Write(m.Top); w.Write(m.Width); w.Write(m.Height); }
     }

@@ -159,12 +159,41 @@ static class Screens
     public static Bounds Virtual => new(Native.GetSystemMetrics(76), Native.GetSystemMetrics(77),
                                         Math.Max(1, Native.GetSystemMetrics(78)), Math.Max(1, Native.GetSystemMetrics(79)));
 
-    static Bounds[]? monitors;
+    static Bounds[]? monitors, reported;
 
     /// <summary>Every monitor's rectangle (cached; call <see cref="Refresh"/> when the display setup changes).</summary>
-    public static Bounds[] Monitors => monitors ??= Load();
+    public static Bounds[] Monitors => monitors ??= Load(includeStandIns: true);
 
-    public static void Refresh() { monitors = null; lock (scales) scales.Clear(); }
+    /// <summary>
+    /// The monitors other PCs and the shared arrangement get to see: all of them except stand-in screens that only
+    /// borrow another PC's spot. ScreenLink's virtual display (monitor MTT1337) shows this PC on a monitor that
+    /// normally shows another PC, so it sits exactly where that PC is arranged; reporting it would make every PC
+    /// shove the arrangement around each time it's switched on or off. Locally it still counts as one of our
+    /// screens, so the cursor moves onto it instead of jumping to the PC it covers.
+    /// </summary>
+    public static Bounds[] Reported => reported ??= Load(includeStandIns: false);
+
+    public static void Refresh() { monitors = null; reported = null; lock (scales) scales.Clear(); }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct DISPLAY_DEVICE
+    {
+        public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+        public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+    }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevices(string? device, uint index, ref DISPLAY_DEVICE dd, uint flags);
+
+    static bool IsStandIn(string deviceName)
+    {
+        var dd = new DISPLAY_DEVICE { cb = Marshal.SizeOf<DISPLAY_DEVICE>() };
+        for (uint i = 0; EnumDisplayDevices(deviceName, i, ref dd, 0); i++, dd.cb = Marshal.SizeOf<DISPLAY_DEVICE>())
+            if (dd.DeviceID?.Contains("MTT1337", StringComparison.OrdinalIgnoreCase) == true) return true;
+        return false;
+    }
 
     [DllImport("shcore.dll")] static extern int GetDpiForMonitor(nint monitor, int type, out uint dpiX, out uint dpiY);
     static readonly System.Collections.Generic.Dictionary<Bounds, double> scales = new();
@@ -188,11 +217,12 @@ static class Screens
         }
     }
 
-    static Bounds[] Load()
+    static Bounds[] Load(bool includeStandIns)
     {
         try
         {
             var all = System.Windows.Forms.Screen.AllScreens
+                .Where(s => includeStandIns || !IsStandIn(s.DeviceName))
                 .OrderBy(s => s.Bounds.Left).ThenBy(s => s.Bounds.Top)
                 .Select(s => new Bounds(s.Bounds.Left, s.Bounds.Top, Math.Max(1, s.Bounds.Width), Math.Max(1, s.Bounds.Height)))
                 .ToArray();
