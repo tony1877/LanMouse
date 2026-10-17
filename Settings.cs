@@ -56,6 +56,11 @@ public sealed class Settings
     /// <summary>Every PC seen so far, so they can be drawn (and numbered) while offline.</summary>
     public Dictionary<string, KnownPc> KnownPcs { get; set; } = new();
 
+    /// <summary>The key is encrypted for this machine rather than this user (the agent's copy, read as LocalSystem).</summary>
+    public bool MachineKey { get; set; }
+
+    DataProtectionScope KeyScope => MachineKey ? DataProtectionScope.LocalMachine : DataProtectionScope.CurrentUser;
+
     /// <summary>Pairing key, encrypted at rest with Windows DPAPI (only your user account can read it).</summary>
     [JsonIgnore]
     public string Key
@@ -63,17 +68,27 @@ public sealed class Settings
         get
         {
             if (string.IsNullOrEmpty(KeyProtected)) return "";
-            try { return Encoding.UTF8.GetString(ProtectedData.Unprotect(Convert.FromBase64String(KeyProtected), null, DataProtectionScope.CurrentUser)); }
+            try { return Encoding.UTF8.GetString(ProtectedData.Unprotect(Convert.FromBase64String(KeyProtected), null, KeyScope)); }
             catch { return ""; }
         }
         set => KeyProtected = string.IsNullOrEmpty(value) ? "" :
-            Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(value), null, DataProtectionScope.CurrentUser));
+            Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(value), null, KeyScope));
     }
 
-    public static Settings Load()
+    /// <summary>
+    /// With sign-in support on, the agent keeps this PC controllable before anyone signs in, using a copy of these
+    /// settings in ProgramData (key encrypted for the machine, file readable only by SYSTEM, admins and this user).
+    /// Off inside the agent itself, so it never rewrites the copy.
+    /// </summary>
+    public static bool WriteAgentCopy = true;
+    public static readonly string AgentCopyPath = Path.Combine(Agent.DataDir, "agent-settings.json");
+
+    public static Settings Load() => LoadFrom(FilePath) ?? new Settings();
+
+    public static Settings? LoadFrom(string path)
     {
-        try { return JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new Settings(); }
-        catch { return new Settings(); }
+        try { return JsonSerializer.Deserialize<Settings>(File.ReadAllText(path)); }
+        catch { return null; }
     }
 
     public void Save()
@@ -84,6 +99,32 @@ public sealed class Settings
             File.WriteAllText(FilePath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { }
+        if (WriteAgentCopy && SignInSupport) SaveAgentCopy();
+    }
+
+    void SaveAgentCopy()
+    {
+        try
+        {
+            var key = Key;
+            var copy = JsonSerializer.Deserialize<Settings>(JsonSerializer.Serialize(this))!;
+            copy.MachineKey = true;
+            copy.Key = key;
+            if (!File.Exists(AgentCopyPath)) File.WriteAllText(AgentCopyPath, "");
+            var acl = new System.Security.AccessControl.FileSecurity();
+            acl.SetAccessRuleProtection(true, false);
+            foreach (var sid in new[]
+            {
+                new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.LocalSystemSid, null),
+                new System.Security.Principal.SecurityIdentifier(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, null),
+                System.Security.Principal.WindowsIdentity.GetCurrent().User!,
+            })
+                acl.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(sid,
+                    System.Security.AccessControl.FileSystemRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+            new FileInfo(AgentCopyPath).SetAccessControl(acl);
+            File.WriteAllText(AgentCopyPath, JsonSerializer.Serialize(copy, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch (Exception e) { SecureInput.ClientLog("cannot write the agent's settings copy: " + e.Message); }
     }
 
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";

@@ -55,7 +55,17 @@ public partial class App : System.Windows.Application
 
         if (settings.AutoConnect && settings.Key.Length >= 8)
         {
-            try { await engine.StartAsync(); } catch { }
+            try
+            {
+                await engine.StartAsync();
+                // Right after sign-in the sign-in agent may still hold the ports for a moment while it hands over.
+                for (int i = 0; i < 20 && engine.Phase == Phase.Stopped && settings.SignInSupport; i++)
+                {
+                    await System.Threading.Tasks.Task.Delay(500);
+                    await engine.StartAsync();
+                }
+            }
+            catch { }
         }
         else if (minimized) window.Show();
     }

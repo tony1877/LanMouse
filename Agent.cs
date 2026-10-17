@@ -237,6 +237,7 @@ static class Agent
     public static void RunWorker()
     {
         Log("worker started");
+        new Thread(HeadlessLoop) { IsBackground = true, Name = "Headless" }.Start();
 
         while (true)
         {
@@ -256,16 +257,82 @@ static class Agent
         }
     }
 
+    /// <summary>
+    /// While no LAN Mouse app is running in this session (nobody signed in yet, or they signed out), run the
+    /// network side ourselves so the other PC can still drive this one. Step aside as soon as the app appears: it
+    /// needs the same ports, and retries for a few seconds while we let go.
+    /// </summary>
+    static void HeadlessLoop()
+    {
+        Settings.WriteAgentCopy = false;
+        Engine? engine = null;
+        long appGoneSince = Environment.TickCount64;
+        while (true)
+        {
+            try
+            {
+                bool app = AppRunning();
+                long now = Environment.TickCount64;
+                if (app) appGoneSince = now;
+                if (app && engine != null)
+                {
+                    engine.Dispose(); engine = null;
+                    CursorHider.RestoreNow();
+                    Log("headless: LAN Mouse app is running, handed over");
+                }
+                else if (!app && engine == null && now - appGoneSince >= 3000)
+                {
+                    var s = Settings.LoadFrom(Settings.AgentCopyPath);
+                    if (s == null || s.Key.Length < 8) { Log("headless: no usable settings copy; open LAN Mouse once with sign-in support on"); Thread.Sleep(30000); continue; }
+                    engine = new Engine(s, headless: true);
+                    engine.StartAsync().GetAwaiter().GetResult();
+                    Log($"headless: engine {engine.Phase}{(engine.Warning is { } w ? " (" + w + ")" : "")}");
+                    if (engine.Phase == Phase.Stopped) { engine.Dispose(); engine = null; Thread.Sleep(5000); }
+                }
+            }
+            catch (Exception e) { Log("headless error: " + e.Message); try { engine?.Dispose(); } catch { } engine = null; Thread.Sleep(5000); }
+            Thread.Sleep(300);
+        }
+    }
+
+    /// <summary>Another LanMouse.exe in this session that isn't the agent: the signed-in user's app.</summary>
+    static bool AppRunning()
+    {
+        int session = Process.GetCurrentProcess().SessionId, self = Environment.ProcessId;
+        foreach (var p in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(Environment.ProcessPath!)))
+            using (p)
+                if (p.Id != self && p.SessionId == session && !IsSystemProcess(p)) return true;
+        return false;
+    }
+
+    static bool IsSystemProcess(Process p)
+    {
+        // An app the user started runs under their account; the worker and service run as LocalSystem.
+        nint h = 0;
+        try
+        {
+            if (!OpenProcessToken(p.Handle, 0x0008 /* TOKEN_QUERY */, out h)) return false;
+            using var id = new WindowsIdentity(h);
+            return id.IsSystem;
+        }
+        catch { return false; }
+        finally { if (h != 0) CloseHandle(h); }
+    }
+
     /// <summary>Run an action on a thread attached to whatever desktop currently has input.</summary>
-    static void OnInputDesktop(Action a)
+    internal static void OnInputDesktop(Action a)
     {
         nint h = OpenInputDesktop(0, false, 0x10000000 /* GENERIC_ALL */);
         if (h == 0) { Log("worker: OpenInputDesktop failed " + Marshal.GetLastWin32Error()); return; }
         var buf = new byte[256];
         string name = GetUserObjectInformation(h, 2 /* UOI_NAME */, buf, buf.Length, out int len) && len > 1
             ? System.Text.Encoding.Unicode.GetString(buf, 0, len - 2) : h.ToString();
-        if (injectors.TryGetValue(name, out var inj)) CloseDesktop(h); // already have a thread on this desktop
-        else { inj = new DesktopInjector(name, h); injectors[name] = inj; }
+        DesktopInjector? inj;
+        lock (injectors) // the pipe and the headless engine both inject
+        {
+            if (injectors.TryGetValue(name, out inj)) CloseDesktop(h); // already have a thread on this desktop
+            else { inj = new DesktopInjector(name, h); injectors[name] = inj; }
+        }
         inj.Post(a);
     }
 

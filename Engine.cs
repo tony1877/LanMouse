@@ -57,7 +57,7 @@ sealed partial class Engine : IDisposable
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "LAN Mouse");
 
     readonly Settings settings;
-    readonly InputHook hook;
+    readonly InputHook? hook;
     public IClipboardSink? Clipboard { get; set; }
 
     readonly object gate = new();
@@ -112,6 +112,7 @@ sealed partial class Engine : IDisposable
     /// </summary>
     bool SecureDesktopBlocks(Peer from)
     {
+        if (headless) return false; // the agent itself injects on the input desktop
         long now = Environment.TickCount64;
         if (now < nextDesktopCheck) return false;
         nextDesktopCheck = now + 200;
@@ -139,12 +140,19 @@ sealed partial class Engine : IDisposable
         return false;
     }
 
-    public Engine(Settings settings)
+    /// <summary>
+    /// Run by the sign-in agent (LocalSystem) while nobody is signed in: this PC can be controlled but captures no
+    /// local input, and injects straight onto whatever desktop has input (usually the sign-in screen).
+    /// </summary>
+    readonly bool headless;
+
+    public Engine(Settings settings, bool headless = false)
     {
         this.settings = settings;
+        this.headless = headless;
         LoadWorld();
         FixLayout(announce: false);
-        hook = new InputHook(OnMouse, OnKey);
+        hook = headless ? null : new InputHook(OnMouse, OnKey);
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaysChanged;
     }
 
@@ -455,7 +463,7 @@ sealed partial class Engine : IDisposable
     {
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaysChanged;
         Stop();
-        hook.Dispose();
+        hook?.Dispose();
         secure.Dispose();
     }
 
@@ -687,6 +695,7 @@ sealed partial class Engine : IDisposable
 
     void InjMove(int x, int y)
     {
+        if (headless) { Agent.OnInputDesktop(() => Inject.MoveTo(x, y)); return; }
         if (!secureActive) { Inject.MoveTo(x, y); return; }
         VerifyAgent();
         secure.Move(x, y);
@@ -717,9 +726,9 @@ sealed partial class Engine : IDisposable
         Notify?.Invoke(Warning);
         ThreadPool.QueueUserWorkItem(_ => Fire());
     }
-    void InjButton(int b, bool down) { if (secureActive) secure.Button(b, down); else Inject.Button(b, down); }
-    void InjWheel(short delta, bool horizontal) { if (secureActive) secure.Wheel(delta, horizontal); else Inject.Wheel(delta, horizontal); }
-    void InjKey(ushort vk, ushort scan, bool ext, bool down) { if (secureActive) secure.Key(vk, scan, ext, down); else Inject.Key(vk, scan, ext, down); }
+    void InjButton(int b, bool down) { if (headless) Agent.OnInputDesktop(() => Inject.Button(b, down)); else if (secureActive) secure.Button(b, down); else Inject.Button(b, down); }
+    void InjWheel(short delta, bool horizontal) { if (headless) Agent.OnInputDesktop(() => Inject.Wheel(delta, horizontal)); else if (secureActive) secure.Wheel(delta, horizontal); else Inject.Wheel(delta, horizontal); }
+    void InjKey(ushort vk, ushort scan, bool ext, bool down) { if (headless) Agent.OnInputDesktop(() => Inject.Key(vk, scan, ext, down)); else if (secureActive) secure.Key(vk, scan, ext, down); else Inject.Key(vk, scan, ext, down); }
 
     void ResetInputState()
     {
